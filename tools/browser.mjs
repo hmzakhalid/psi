@@ -111,6 +111,8 @@ export async function launch({ width = 1280, height = 720 } = {}) {
   await send('Runtime.enable');
   await send('Page.enable');
   await send('Log.enable');
+  // an exact viewport, so the 16:9 stage fills screenshots edge to edge
+  await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
 
   /** Evaluate an expression in the page and return its value. */
   async function evaluate(expression, { awaitPromise = false } = {}) {

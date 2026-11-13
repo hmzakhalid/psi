@@ -26,7 +26,7 @@ const SHOTS = {
   mirror: inRoom('MIRROR', 3.1, '0.2:m:107:32,0.4:d,1.5:u,2.4:m:200:60'),
   return: inRoom('RETURN', 2.35, '0.2:m:96:72,0.4:d,1.5:u,1.6:m:150:72,2.2:d'),
   ricochet: inRoom('RICOCHET', 3.2, '0.2:m:70:141,0.4:d,1.5:u,2.0:m:200:30'),
-  lens: inRoom('LENS', 3.15, '0.1:tp:36:72,0.2:m:108:72,0.4:d,1.5:u,2.0:m:200:30'),
+  lens: inRoom('LENS', 3.15, '0.1:tp:36:72,0.2:m:108:72,0.4:d,1.5:u,2.0:m:196:112'),
   interference: inRoom('INTERFERENCE', 2.9, '0.1:tp:48:54,0.2:m:100:72,0.4:d,1.5:u,2.0:m:180:40'),
   superposition: inRoom('SUPERPOSITION', 2.6, '0.1:tp:53:104,0.2:m:53:20,0.4:d,1.2:u,2.2:m:60:40'),
 };
@@ -43,7 +43,7 @@ for (const name of names) {
   await browser.goto(`${server.url}?${SHOTS[name]}`);
   await sleep(350);   // a few real frames so the exposure settles on the frozen field
   await browser.screenshot(join(out, `${name}.png`));
-  console.log(`${name}.png`);
+  console.log(join(out, `${name}.png`));
 }
 if (browser.errors.length) { console.log('page errors:'); for (const e of browser.errors) console.log('  ' + e); }
 await browser.close();
