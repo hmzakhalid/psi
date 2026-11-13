@@ -168,8 +168,8 @@ const strategies = {
       if (!s.keys[0] && s.x < 96) {                                       // leak through, then look before the red wall
         await walkTo(50, 72, 2);
         await fire(96, 72);
-        await move(150, 72); await sleep(800);
-        s = await look(150, 72, 450);
+        await move(166, 72); await sleep(800);                          // where the packet will be about 1.2 s after launch
+        s = await look(166, 72, 480);
         if (s.mode === 'wave') s = await flightOver();
       } else if (!s.keys[0]) {
         await walkTo(196, 28, 3);
@@ -375,6 +375,32 @@ async function menus() {
   expect(JSON.parse(saved).reached >= 1 && !!JSON.parse(saved).cleared.PARTICLE, 'progress survives a reload: ' + saved);
   await tap(128, 72); await sleep(500); await settled();
   expect(await scene() === 'rooms', 'a returning player lands on the room select');
+
+  // Saved progress is never trusted: corrupted or hostile values must not crash or unlock anything.
+  const alive = async () => { const a = await evaluate('window.__psi.S.clock'); await sleep(250); return (await evaluate('window.__psi.S.clock')) > a; };
+  const hostile = [
+    '{"reached":12}', '{"reached":1e9,"cleared":[]}', '{"reached":-3}', '{"reached":"7"}', 'not json', '[]', 'null',
+    '{"reached":1,"cleared":{"PARTICLE":{"seconds":{"toString":0}}}}',
+    '{"reached":2,"cleared":{"PARTICLE":"x","WAVE":null,"__proto__":{"seconds":1}}}',
+  ];
+  for (const value of hostile) {
+    await browser.goto(baseUrl);
+    await evaluate(`localStorage.setItem('psi-progress-v1', ${JSON.stringify(value)})`);
+    await browser.goto(baseUrl);
+    const reached = await evaluate('window.__psi.game.progress.reached');
+    expect(Number.isInteger(reached) && reached >= 0 && reached < names.length, `saved ${value} loads as a valid room index (got ${reached})`);
+    await tap(128, 72); await sleep(500); await settled();          // title -> rooms or room 1
+    await keyDown('Enter'); await keyUp('Enter'); await sleep(600); await settled();
+    await keyDown('Escape'); await keyUp('Escape'); await sleep(500); await settled();
+    expect(await alive(), `the game keeps running with saved ${value}`);
+  }
+  await browser.goto(baseUrl);
+  await evaluate('localStorage.clear()');
+
+  for (const bad of ['abc', '1.5', '0', '999', '-2', '']) {
+    await browser.goto(`${baseUrl}?lvl=${bad}`);
+    expect(await scene() === 'title' && await alive(), `?lvl=${bad} opens the title instead of crashing`);
+  }
   return problems;
 }
 

@@ -2,7 +2,8 @@
 // Checks every room against the physics: the intended shot wins, the careless shot is clearly
 // worse, and nothing that needs a wave can simply be walked. Runs in a few seconds, no browser.
 
-import { RED } from '../src/physics.js';
+import { RED, GREEN, W } from '../src/physics.js';
+import { createGame } from '../src/game.js';
 import { levels, fly, aim, massIn, centroid, walkReport, odds, percent, room, cellIndex, FULL, TAP } from './lab.mjs';
 
 let failures = 0;
@@ -142,6 +143,40 @@ heading('SUPERPOSITION'); {
   check(massIn(up.world, 0, 0, 100, 72) > 0.3, 'A to B through the gaps after 1.2 s: ' + percent(massIn(up.world, 0, 0, 100, 72)));
   const across = fly(level, { x: 70, y: 38, deg: 0, secs: 0.9, unlocked: false });
   check(massIn(across.world, 104, 0, 256, 144) > 0.6 && across.red < 0.02, 'B to C through the barrier after 0.9 s: ' + percent(massIn(across.world, 104, 0, 256, 144)));
+}
+
+// The exit gate, exercised through the game's own rules rather than read off the map:
+// in a room with keys, standing on the exit does nothing until every key has been touched.
+{
+  console.log('   exit gates');
+  const silent = new Proxy({}, { get: () => () => {} });   // a stand-in for the audio
+  const TICK = 1 / 120;
+  for (const level of levels) {
+    const game = createGame(silent), { S, world } = game;
+    S.scene = 'play';
+    game.enterLevel(levels.indexOf(level));
+    // stand in the middle of the exit (its edge can touch a neighbouring red detector)
+    const middle = S.exit ? Math.round(S.exit.y) * W + Math.round(S.exit.x) : -1;
+    const exitCell = middle >= 0 && world.walk[middle] && world.kind[middle] === GREEN ? middle : [...world.greenCells].find(i => world.walk[i]);
+    const standOn = (x, y) => { S.px = x; S.py = y; S.vx = S.vy = 0; for (let i = 0; i < 3; i++) game.update(TICK); };
+    if (exitCell === undefined) { check(false, `${level.name}: the exit has a standable cell`); continue; }
+    const [ex, ey] = [exitCell % W, Math.floor(exitCell / W)];
+    if (level.keys.length === 0) {
+      standOn(ex, ey);
+      check(S.mode === 'won', `${level.name}: no keys, standing on the exit wins`);
+      continue;
+    }
+    standOn(ex, ey);
+    check(S.mode === 'particle', `${level.name}: the exit is asleep while a key is missing`);
+    level.keys.slice(0, -1).forEach(([x, y]) => standOn(x, y));
+    standOn(ex, ey);
+    check(S.mode === 'particle' && !game.exitOpen(), `${level.name}: it stays asleep until the last key`);
+    standOn(...level.keys[level.keys.length - 1]);
+    check(game.exitOpen(), `${level.name}: touching every key wakes it`);
+    standOn(ex, ey);
+    check(S.mode === 'won', `${level.name}: then standing on it wins`);
+  }
+  for (const name of ['OBSERVER', 'RETURN', 'SUPERPOSITION']) check(room(name).keys.length > 0, `${name} has a key, as its other checks assume`);
 }
 
 const covered = ['PARTICLE', 'WAVE', 'OBSERVER', 'TUNNEL', 'GENTLY', 'MIRROR', 'RETURN', 'SCANNER', 'RICOCHET', 'LENS', 'INTERFERENCE', 'SUPERPOSITION'];

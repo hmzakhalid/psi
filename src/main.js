@@ -69,6 +69,7 @@ function runScript() {
     else if (command === 'tp') { S.px = Number(args[0]); S.py = Number(args[1]); }
     else if (command === 'key') game.held[args[0]] = args[1] === '1';
     else if (command === 'lvl') game.enterLevel(Number(args[0]) - 1);
+    else if (command === 'title') game.showTitle();
     else if (command === 'end') game.showEnding();
     else if (command === 'rooms') game.showRooms();
     else if (command === 'help') game.toggleHelp();
@@ -109,9 +110,11 @@ function advance(dt) {
   ticksLastFrame = ticks;
 }
 
-if (query.has('lvl')) {
+// ?lvl= must be a whole room number; anything else opens the title as usual.
+const startRoom = /^\d+$/.test(query.get('lvl') || '') ? Number(query.get('lvl')) : 0;
+if (startRoom >= 1 && startRoom <= game.levels.length) {
   S.scene = 'play';
-  game.enterLevel(Math.max(0, Math.min(game.levels.length - 1, Number(query.get('lvl')) - 1)));
+  game.enterLevel(startRoom - 1);
 } else {
   game.showTitle();
 }
@@ -126,6 +129,7 @@ function frame(now) {
   lastTime = now;
   let dt = fixedStep || (elapsed > 0.25 || !(elapsed >= 0) ? 0 : elapsed);
   if (S.clock >= stopAt) { document.title = 'DONE'; dt = 0; }
+  if (S.resync) { S.resync = false; dt = 0; tickDebt = SIM.tick / 2; }   // a pause just ended: start the clock clean
 
   const started = performance.now();
   if (dt > 0) advance(dt);

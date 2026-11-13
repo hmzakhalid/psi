@@ -54,7 +54,7 @@ export function createGame(audio) {
   const pointer = { x: W * 0.6, y: H * 0.5 };                       // in grid cells
   const held = { left: false, right: false, up: false, down: false };   // walking keys
 
-  const progress = loadProgress();
+  const progress = loadProgress(levels.map(l => l.name));
   const lessonsShown = { decohered: 0, caught: 0, missed: 0 };
 
   const freshStats = () => ({ looks: 0, deaths: 0, time: 0, waves: 0, logw: 0 });
@@ -63,6 +63,7 @@ export function createGame(audio) {
   const S = {
     scene: 'title',            // 'title' | 'rooms' | 'play' | 'end'
     help: false,               // the how-it-works overlay is open, and play is paused
+    resync: false,             // set when a pause ends: the loop must not replay the paused time
     toast: null,               // a short explanation shown in place of the hint: { lines, t }
     clock: 0,                  // seconds since the page loaded
     lvl: 0,
@@ -110,6 +111,7 @@ export function createGame(audio) {
   }
 
   function enterLevel(index) {
+    index = Number.isInteger(index) ? Math.max(0, Math.min(levels.length - 1, index)) : 0;
     const lv = levels[index];
     S.lvl = index;
     loadLevel(world, lv);
@@ -325,14 +327,14 @@ export function createGame(audio) {
     pressedAt = timestamp >= 0 ? timestamp : -1;
     audio.start();
     if (S.trans) return;
-    if (S.help) { S.help = false; return; }
+    if (S.help) { closeHelp(); return; }
     if (S.scene === 'title') {
       if (progress.reached > 0) transition(showRooms); else openRoom(0);
       return;
     }
     if (S.scene === 'rooms') {
       const card = fromKeyboard ? progress.reached : cardAt(pointer.x, pointer.y, levels.length);
-      if (card >= 0 && card <= progress.reached) { audio.click(); openRoom(card); }
+      if (card >= 0 && card < levels.length && card <= progress.reached) { audio.click(); openRoom(card); }
       return;
     }
     if (S.scene === 'end') { transition(showRooms); return; }
@@ -363,17 +365,24 @@ export function createGame(audio) {
     nextLevel();
   }
 
+  // Closing help asks the loop to drop the time since the last frame, so none of the pause is played back.
+  function closeHelp() {
+    S.help = false;
+    S.resync = true;
+  }
+
   /** H: open or close the how-it-works overlay. Play is paused while it is open. */
   function toggleHelp() {
     if (S.trans) return;
-    S.help = !S.help;
-    if (S.help) cancelInput();
+    if (S.help) { closeHelp(); return; }
+    S.help = true;
+    cancelInput();
   }
 
   /** Escape: close help, or step back one screen (room → rooms → title). */
   function back() {
     if (S.trans) return;
-    if (S.help) { S.help = false; return; }
+    if (S.help) { closeHelp(); return; }
     if (S.scene === 'play' || S.scene === 'end') transition(showRooms);
     else if (S.scene === 'rooms') transition(showTitle);
   }
