@@ -103,6 +103,7 @@ function advance(dt) {
   let ticks = 0;
   while (tickDebt >= SIM.tick - 1e-9 && S.clock < stopAt) {
     runScript();
+    if (S.resync) { S.resync = false; tickDebt = SIM.tick / 2; break; }   // a scripted pause just ended
     game.update(SIM.tick);
     tickDebt -= SIM.tick;
     if (++ticks >= 40) { tickDebt = SIM.tick / 2; break; }

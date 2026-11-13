@@ -2,7 +2,7 @@
 // Checks every room against the physics: the intended shot wins, the careless shot is clearly
 // worse, and nothing that needs a wave can simply be walked. Runs in a few seconds, no browser.
 
-import { RED, GREEN, W } from '../src/physics.js';
+import { RED, GREEN, WALL, BARRIER, W } from '../src/physics.js';
 import { createGame } from '../src/game.js';
 import { levels, fly, aim, massIn, centroid, walkReport, odds, percent, room, cellIndex, FULL, TAP } from './lab.mjs';
 
@@ -175,6 +175,33 @@ heading('SUPERPOSITION'); {
     check(game.exitOpen(), `${level.name}: touching every key wakes it`);
     standOn(ex, ey);
     check(S.mode === 'won', `${level.name}: then standing on it wins`);
+
+    // The same gate for waves: fire at the exit from close by, with the keys missing and then taken.
+    const clearShot = cell => {
+      const x = cell % W, y = Math.floor(cell / W), distance = Math.hypot(x - ex, y - ey);
+      if (!world.walk[cell] || distance < 25 || distance > 45) return false;
+      for (let t = 0; t <= 1; t += 1 / distance) {
+        const kind = world.kind[Math.round(y + (ey - y) * t) * W + Math.round(x + (ex - x) * t)];
+        if (kind === WALL || kind === BARRIER || kind === RED) return false;
+      }
+      return true;
+    };
+    const fireAtExit = seconds => {
+      const from = world.walk.findIndex((_, cell) => clearShot(cell));
+      S.px = from % W; S.py = Math.floor(from / W); S.mode = 'particle';
+      game.pointer.x = ex; game.pointer.y = ey;
+      game.press(0); game.release(1000);                       // a full-charge launch through the real input path
+      let green = 0, won = false;
+      for (let i = 0; i < seconds * 120; i++) { game.update(TICK); green = Math.max(green, S.fateGreen); won ||= S.mode === 'won'; }
+      return { green, won };
+    };
+    game.enterLevel(levels.indexOf(level));
+    const locked = fireAtExit(2.5);
+    check(locked.green === 0 && !locked.won, `${level.name}: a wave fired at the sleeping exit is not absorbed by it`);
+    game.enterLevel(levels.indexOf(level));
+    level.keys.forEach(([x, y]) => standOn(x, y));
+    const open = fireAtExit(2.5);
+    check(open.green > 0.2 || open.won, `${level.name}: with the keys taken the same shot is caught by the exit (${open.won ? 'won' : percent(open.green)})`);
   }
   for (const name of ['OBSERVER', 'RETURN', 'SUPERPOSITION']) check(room(name).keys.length > 0, `${name} has a key, as its other checks assume`);
 }
