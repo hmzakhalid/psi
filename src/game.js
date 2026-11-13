@@ -1,758 +1,484 @@
-// ψ game: rendering, input, sound, rules. Physics lives in core.js, rooms in levels.js.
-(() => {
-  'use strict';
-  const { W, H, N, PR, World, WALL, BARRIER, RED, GREEN, GLASS, MESH } = PSI;
-  const { levels, KMIN, KMAX, LAUNCH_SIGMA, STEPS_PER_SEC } = PSI_LEVELS;
-  const Q = new URLSearchParams(location.search);
-  const $ = id => document.getElementById(id);
-  const TAU = Math.PI * 2;
+// The rules of ψ: what the player can do, and what happens when something observes them.
+//
+// You are a particle (you walk) or a wave (the Schrödinger equation moves you). Three things turn a
+// wave back into a particle: a detector catches you, you look for yourself, or coherence runs out.
 
-  function fail(msg) { document.title = 'ERR ' + msg; const d = $('err'); d.textContent = 'Something broke: ' + msg; d.style.display = 'block'; }
-  window.addEventListener('error', e => fail(e.message + ' @' + e.lineno + ':' + e.colno));
-  window.addEventListener('unhandledrejection', e => fail('promise: ' + ((e.reason && e.reason.message) || e.reason)));
+import { W, H, N, PARTICLE_RADIUS, RED, GREEN, World } from './physics.js';
+import { levels, loadLevel, moveSweepers } from './levels.js';
+import { PLAYER, CHARGE, LENS, SIM, momentum } from './config.js';
+import { random } from './rng.js';
+import { createEffects } from './effects.js';
+import { buildTitleRoom, buildEndRoom, driftAmbient } from './ambient.js';
 
-  // seeded so a test run can be replayed
-  let seed = Q.has('seed') ? (+Q.get('seed')) | 0 : (Math.random() * 4294967296) | 0;
-  function rnd() { seed = (seed + 0x6D2B79F5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }
+const COLOR = {
+  found: 'rgba(170,235,255,',
+  exit: 'rgba(120,255,190,',
+  exitText: 'rgba(150,255,205,',
+  death: 'rgba(255,90,110,',
+  deathText: 'rgba(255,120,135,',
+  key: 'rgba(255,220,120,',
+  decohered: 'rgba(200,200,255,',
+  miss: 'rgba(210,215,235,',
+  launch: 'rgba(160,220,255,',
+};
 
-  const SPEED = 48, CHARGE_TIME = 1.0, IDLE_SIGMA = 2.6;
-  const LENS0 = 10, LENS_MAX = 46, LENS_GROW = 34, COHERENCE = 10;
-  const FONT = 'ui-monospace, "SF Mono", Menlo, Consolas, monospace';
+const RESPAWN_DELAY = 0.75;     // seconds between dying and standing again
+const WIN_DELAY = 1.5;          // seconds the win is shown before the next room
+const FADE_OUT = 0.35, FADE_IN = 0.4;
 
-  const stage = $('stage'); let glc = $('gl'); const uic = $('ui'); const ui = uic.getContext('2d');
-  const world = new World();
-  const fieldBytes = new Uint8Array(N * 4), levelBytes = new Uint8Array(N * 4), levelBase = new Uint8Array(N * 4);
-  const glass = new Uint8Array(N);
+const clampCell = (x, y) => Math.max(0, Math.min(H - 1, Math.round(y))) * W + Math.max(0, Math.min(W - 1, Math.round(x)));
+const cellX = i => i % W;
+const cellY = i => Math.floor(i / W);
 
-  // ---------------------------------------------------------------- renderer
-  let gl = null, U = {}, texF = null, texL = null, texG = null, ctx2 = null, off = null, offCtx = null, img = null;
-  const PAL_A = [0.55, 0.52, 0.62], PAL_B = [-0.45, 0.36, 0.42], PAL_D = [-0.1, 0.1, -0.1];
-  const VS = 'attribute vec2 p; varying vec2 v; void main(){ v=vec2(p.x*0.5+0.5,0.5-p.y*0.5); gl_Position=vec4(p,0.0,1.0); }';
-  const FS = `
-precision highp float;
-varying vec2 v;
-uniform sampler2D uF, uL, uG;
-uniform vec2 uGrid;
-uniform float uT, uLocked, uFlash;
-vec3 pal(float t){ return vec3(${PAL_A})+vec3(${PAL_B})*cos(6.2831853*(t+vec3(${PAL_D}))); }
-vec2 tap(vec2 ij){ vec2 c=(texture2D(uF,(ij+0.5)/uGrid).rg-0.5019608)*2.007874; return c*abs(c); }
-vec4 cr(float f){ float f2=f*f, f3=f2*f; return vec4(-0.5*f3+f2-0.5*f, 1.5*f3-2.5*f2+1.0, -1.5*f3+2.0*f2+0.5*f, 0.5*f3-0.5*f2); }
-vec2 row(float y, float x, vec4 w){ return tap(vec2(x-1.0,y))*w.x+tap(vec2(x,y))*w.y+tap(vec2(x+1.0,y))*w.z+tap(vec2(x+2.0,y))*w.w; }
-vec2 psi(vec2 uv){
-  vec2 q=uv*uGrid-0.5, i=floor(q), f=q-i; vec4 wx=cr(f.x), wy=cr(f.y);
-  return row(i.y-1.0,i.x,wx)*wy.x+row(i.y,i.x,wx)*wy.y+row(i.y+1.0,i.x,wx)*wy.z+row(i.y+2.0,i.x,wx)*wy.w;
+// The cells covered by the particle's body, as offsets from its centre.
+const BODY = [];
+for (let dy = -Math.ceil(PARTICLE_RADIUS); dy <= Math.ceil(PARTICLE_RADIUS); dy++) {
+  for (let dx = -Math.ceil(PARTICLE_RADIUS); dx <= Math.ceil(PARTICLE_RADIUS); dx++) {
+    if (dx * dx + dy * dy <= PARTICLE_RADIUS * PARTICLE_RADIUS) BODY.push(dy * W + dx);
+  }
 }
-float amp2(vec2 uv){ float a=texture2D(uG,uv).a; return a*a; }
-float hash(vec2 q){ return fract(sin(dot(q,vec2(127.1,311.7)))*43758.5453); }
-void main(){
-  vec2 g=v*uGrid, px=1.0/uGrid;
-  vec4 lv=texture2D(uL,v);
-  vec2 z=psi(v); float d=dot(z,z);
-  float ph=atan(z.y,z.x)/6.2831853;
-  float glow=0.0;
-  for(int i=0;i<8;i++){
-    float a=float(i)*0.7853982+0.3; vec2 o=vec2(cos(a),sin(a));
-    glow+=amp2(v+o*px*2.5)*0.8+amp2(v+o*px*6.5)*0.5;
-  }
-  glow/=8.0;
-  vec3 col=mix(vec3(0.022,0.026,0.055),vec3(0.010,0.012,0.030),v.y);
-  vec2 gr=abs(fract(g/8.0)-0.5);
-  col+=vec3(0.05,0.07,0.15)*smoothstep(0.46,0.5,max(gr.x,gr.y))*0.30;
-  float wall=smoothstep(0.35,0.65,lv.r);
-  vec3 wc=pal(ph);
-  float b=pow(min(d,1.0),0.42);
-  vec3 wave=wc*b*1.5+mix(wc,vec3(0.35,0.5,1.0),0.6)*pow(glow,0.6)*0.5;
-  float gls=texture2D(uG,v).b;
-  col+=vec3(0.22,0.70,0.95)*smoothstep(0.55,0.9,gls)*(0.22+0.55*step(0.5,fract(g.y/2.0+uT*0.25)))+vec3(0.05,0.20,0.24)*smoothstep(0.2,0.43,gls)*(1.0-smoothstep(0.5,0.6,gls));
-  float zr=smoothstep(0.3,0.7,lv.b), zg=smoothstep(0.3,0.7,lv.g), zb=smoothstep(0.3,0.7,lv.a);
-  float scan=0.5+0.5*sin(g.y*1.4-uT*5.0);
-  col=mix(col,vec3(0.50,0.045,0.10)*(0.26+0.16*scan),zr*0.9);
-  float pulse=0.5+0.5*sin(uT*2.2-g.x*0.12);
-  vec3 gc=mix(vec3(0.06,0.62,0.36)*(0.30+0.14*pulse),vec3(0.16,0.18,0.22)*(0.35+0.25*step(0.5,fract((g.x+g.y)/6.0))),uLocked);
-  col=mix(col,gc,zg*0.9);
-  col+=vec3(0.42,0.30,1.0)*zb*(0.16+0.26*step(0.5,fract(g.y/3.0+uT*0.4)));
-  col+=wave*(1.0-wall)*(1.0+zr*0.6+zg*0.4);
-  float er=smoothstep(0.08,0.5,lv.b)*(1.0-smoothstep(0.5,0.92,lv.b));
-  float eg=smoothstep(0.08,0.5,lv.g)*(1.0-smoothstep(0.5,0.92,lv.g));
-  col+=vec3(1.0,0.22,0.30)*er*0.75+mix(vec3(0.25,1.0,0.6),vec3(0.4),uLocked)*eg*0.55;
-  vec3 wcol=vec3(0.070,0.080,0.130)+vec3(0.018)*hash(floor(g));
-  col=mix(col,wcol,wall);
-  float e=smoothstep(0.06,0.5,lv.r)*(1.0-smoothstep(0.5,0.94,lv.r));
-  col+=(vec3(0.26,0.36,0.72)*0.5+wc*pow(glow,0.5)*1.3)*e;
-  vec2 c=v-0.5; col*=1.0-0.55*dot(c,c);
-  col+=uFlash*vec3(0.55,0.65,0.9);
-  col=1.0-exp(-col*1.7);
-  col+=(hash(g*3.1+uT)-0.5)*0.014;
-  gl_FragColor=vec4(col,1.0);
-}`;
 
-  function initGL() {
-    if (Q.has('nogl')) return false;
-    try {
-      gl = glc.getContext('webgl', { antialias: false, alpha: false }) || glc.getContext('experimental-webgl');
-      if (!gl) return false;
-      const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
-      const prog = gl.createProgram();
-      gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS)); gl.linkProgram(prog);
-      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
-      gl.useProgram(prog);
-      const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-      const loc = gl.getAttribLocation(prog, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-      for (const n of ['uF', 'uL', 'uG', 'uGrid', 'uT', 'uLocked', 'uFlash']) U[n] = gl.getUniformLocation(prog, n);
-      const tex = (unit, filter) => {
-        const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-        return t;
-      };
-      texF = tex(0, gl.NEAREST); texL = tex(1, gl.LINEAR); texG = tex(2, gl.LINEAR);
-      gl.uniform1i(U.uF, 0); gl.uniform1i(U.uL, 1); gl.uniform1i(U.uG, 2); gl.uniform2f(U.uGrid, W, H);
-      return true;
-    } catch (err) { if (window.console) console.warn('WebGL unavailable, using the plain renderer:', err); gl = null; return false; }
-  }
-  function initFallback() {
-    // a canvas that has handed out a webgl context cannot give a 2d one, so swap in a fresh canvas
-    const c = document.createElement('canvas'); c.id = 'gl'; glc.replaceWith(c); glc = c; ctx2 = c.getContext('2d');
-    off = document.createElement('canvas'); off.width = W; off.height = H; offCtx = off.getContext('2d'); img = offCtx.createImageData(W, H);
-  }
+export function createGame(audio) {
+  const world = new World();
+  const effects = createEffects(random);
+  const pointer = { x: W * 0.6, y: H * 0.5 };                       // in grid cells
+  const held = { left: false, right: false, up: false, down: false };   // walking keys
 
-  let levelDirty = true, dispMax = 1e-3;
-  function bakeLevel() {
-    const k = world.kind;
-    for (let i = 0, j = 0; i < N; i++, j += 4) {
-      const t = k[i];
-      levelBase[j] = t === WALL ? 255 : 0; levelBase[j + 1] = t === GREEN ? 255 : 0;
-      levelBase[j + 2] = t === RED ? 255 : 0; levelBase[j + 3] = t === BARRIER ? 255 : 0;
-      glass[i] = t === MESH ? 255 : t === GLASS ? 110 : 0;
-    }
-    levelDirty = true;
-  }
-  function stampLevel() {
-    levelBytes.set(levelBase);
-    for (const s of world.sweepers) {
-      const x0 = Math.max(0, s.cx - s.w / 2 | 0), x1 = Math.min(W, s.cx + s.w / 2 | 0);
-      const y0 = Math.max(0, s.cy - s.h / 2 | 0), y1 = Math.min(H, s.cy + s.h / 2 | 0);
-      for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) levelBytes[(y * W + x) * 4 + 2] = 255;
-    }
-  }
-  function packField(dt) {
-    const R = world.R, I = world.I;
-    const target = Math.max(world.maxDensity || 0, S.norm * 1.5e-4, 1e-12);
-    dispMax += (target - dispMax) * Math.min(1, dt * 7 + (target > dispMax ? 0.5 : 0));
-    const s = 1 / Math.sqrt(dispMax);
-    for (let i = 0, j = 0; i < N; i++, j += 4) {
-      let a = R[i] * s, b = I[i] * s;
-      a = a > 1 ? 1 : a < -1 ? -1 : a; b = b > 1 ? 1 : b < -1 ? -1 : b;
-      fieldBytes[j] = 128 + 127 * (a < 0 ? -Math.sqrt(-a) : Math.sqrt(a));
-      fieldBytes[j + 1] = 128 + 127 * (b < 0 ? -Math.sqrt(-b) : Math.sqrt(b));
-      fieldBytes[j + 2] = glass[i]; fieldBytes[j + 3] = 255 * Math.min(1, Math.sqrt(a * a + b * b));
-    }
-  }
-  function drawWorld(dt, locked) {
-    packField(dt);
-    if (levelDirty || world.sweepers.length) { stampLevel(); }
-    if (gl) {
-      gl.viewport(0, 0, glc.width, glc.height);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texF);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, fieldBytes);
-      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texG);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, fieldBytes);
-      if (levelDirty || world.sweepers.length) {
-        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texL);
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, levelBytes);
-      }
-      gl.uniform1f(U.uT, S.clock % 1000); gl.uniform1f(U.uLocked, locked ? 1 : 0); gl.uniform1f(U.uFlash, S.flash);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    } else {
-      // plain renderer: same picture, shaded per cell on the CPU
-      const d = img.data, t = S.clock;
-      for (let y = 0, i = 0, j = 0; y < H; y++) for (let x = 0; x < W; x++, i++, j += 4) {
-        const cr = (fieldBytes[j] - 128) / 127, ci = (fieldBytes[j + 1] - 128) / 127;
-        const re = cr * Math.abs(cr), im = ci * Math.abs(ci), b = Math.sqrt(re * re + im * im) * 1.6;
-        let r = 0.022, g = 0.026, bl = 0.055;
-        if (levelBytes[j + 2]) { const sc = 0.26 + 0.16 * (0.5 + 0.5 * Math.sin(y * 1.4 - t * 5)); r = 0.5 * sc; g = 0.045 * sc; bl = 0.1 * sc; }
-        else if (levelBytes[j + 1]) { if (locked) { r = 0.06; g = 0.07; bl = 0.085; } else { const pu = 0.30 + 0.14 * (0.5 + 0.5 * Math.sin(t * 2.2 - x * 0.12)); r = 0.06 * pu; g = 0.62 * pu; bl = 0.36 * pu; } }
-        if (levelBytes[j + 3]) { r += 0.42 * 0.3; g += 0.3 * 0.3; bl += 0.3; }
-        if (b > 0.004) {
-          const ph = Math.atan2(im, re) / TAU;
-          r += (PAL_A[0] + PAL_B[0] * Math.cos(TAU * (ph + PAL_D[0]))) * b;
-          g += (PAL_A[1] + PAL_B[1] * Math.cos(TAU * (ph + PAL_D[1]))) * b;
-          bl += (PAL_A[2] + PAL_B[2] * Math.cos(TAU * (ph + PAL_D[2]))) * b;
-        }
-        if (levelBytes[j]) { r = 0.075; g = 0.085; bl = 0.14; }
-        r += S.flash * 0.5; g += S.flash * 0.6; bl += S.flash * 0.8;
-        d[j] = 255 * (1 - Math.exp(-r * 1.7)); d[j + 1] = 255 * (1 - Math.exp(-g * 1.7)); d[j + 2] = 255 * (1 - Math.exp(-bl * 1.7)); d[j + 3] = 255;
-      }
-      offCtx.putImageData(img, 0, 0);
-      ctx2.imageSmoothingEnabled = true; ctx2.imageSmoothingQuality = 'high';
-      ctx2.drawImage(off, 0, 0, glc.width, glc.height);
-    }
-    levelDirty = false;
-  }
+  const freshStats = () => ({ looks: 0, deaths: 0, time: 0, waves: 0, logw: 0 });
 
-  let TS = 1;   // text grows a little when the game is shown small, so the HUD stays readable
-  function resize() {
-    const r = stage.getBoundingClientRect(), dpr = Math.min(2, window.devicePixelRatio || 1);
-    TS = Math.max(1, Math.min(1.3, 1000 / Math.max(1, r.width)));
-    const fit = Math.min(1, 2560 / Math.max(1, r.width * dpr));   // cap the pixel count on very large displays
-    const w = Math.max(320, Math.round(r.width * dpr * fit)), h = Math.max(180, Math.round(r.height * dpr * fit));
-    for (const c of [glc, uic]) if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
-  }
-
-  // ---------------------------------------------------------------- sound
-  const snd = (() => {
-    let ac = null, master = null, wet = null, ok = false, muted = false, nbuf = null, warned = 0;
-    const warn = err => { if (warned++ < 3 && window.console) console.warn('psi sound:', err); };
-    const voices = [], SCALE = [587.33, 523.25, 440, 392, 349.23, 293.66];
-    function start() {
-      if (ac) { if (ac.state === 'suspended') ac.resume().catch(() => { }); return; }
-      try {
-        const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
-        ac = new AC();
-        master = ac.createGain(); master.gain.value = 0.8;
-        const comp = ac.createDynamicsCompressor(); master.connect(comp); comp.connect(ac.destination);
-        const dl = ac.createDelay(1); dl.delayTime.value = 0.31;
-        const fb = ac.createGain(); fb.gain.value = 0.4;
-        const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 2200;
-        wet = ac.createGain(); wet.gain.value = 0.4; wet.connect(dl); dl.connect(lp); lp.connect(fb); fb.connect(dl); lp.connect(master);
-        const dg = ac.createGain(); dg.gain.value = 0; dg.gain.setTargetAtTime(0.10, ac.currentTime, 2.5);
-        const df = ac.createBiquadFilter(); df.type = 'lowpass'; df.frequency.value = 210; df.Q.value = 1.2;
-        for (const [f, type, det] of [[73.42, 'sawtooth', -6], [73.42, 'sawtooth', 7], [110, 'sine', 0], [146.83, 'triangle', 3]]) {
-          const o = ac.createOscillator(); o.type = type; o.frequency.value = f; o.detune.value = det; o.connect(df); o.start();
-        }
-        df.connect(dg); dg.connect(master);
-        const lfo = ac.createOscillator(); lfo.frequency.value = 0.07; const lg = ac.createGain(); lg.gain.value = 70; lfo.connect(lg); lg.connect(df.frequency); lfo.start();
-        for (let i = 0; i < 6; i++) {
-          const o = ac.createOscillator(); o.type = 'sine'; o.frequency.value = SCALE[i];
-          const o2 = ac.createOscillator(); o2.type = 'triangle'; o2.frequency.value = SCALE[i] / 2; o2.detune.value = 6;
-          const g = ac.createGain(); g.gain.value = 0;
-          const p = ac.createStereoPanner ? ac.createStereoPanner() : null;
-          o.connect(g); o2.connect(g);
-          if (p) { g.connect(p); p.connect(master); p.connect(wet); } else { g.connect(master); g.connect(wet); }
-          o.start(); o2.start(); voices.push({ g, p });
-        }
-        nbuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
-        const nd = nbuf.getChannelData(0); for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
-        ok = true;
-      } catch (err) { warn(err); ac = null; ok = false; }
-    }
-    function env(g, t, a, d, peak) { g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(peak, t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); }
-    function tone(f0, f1, dur, peak, type = 'sine', delay = 0, echo = true) {
-      if (!ok || muted) return;
-      try {
-        const t = ac.currentTime + delay, o = ac.createOscillator(), g = ac.createGain();
-        o.type = type; o.frequency.setValueAtTime(f0, t); if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
-        env(g, t, 0.008, dur, peak); o.connect(g); g.connect(master); if (echo) g.connect(wet);
-        o.start(t); o.stop(t + dur + 0.1);
-      } catch (err) { warn(err); }
-    }
-    function noise(dur, peak, f0, f1, q = 1, delay = 0) {
-      if (!ok || muted) return;
-      try {
-        const t = ac.currentTime + delay, s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
-        s.buffer = nbuf; s.loop = true; f.type = 'bandpass'; f.Q.value = q;
-        f.frequency.setValueAtTime(f0, t); f.frequency.exponentialRampToValueAtTime(f1, t + dur);
-        env(g, t, 0.01, dur, peak); s.connect(f); f.connect(g); g.connect(master); g.connect(wet);
-        s.start(t); s.stop(t + dur + 0.1);
-      } catch (err) { warn(err); }
-    }
-    return {
-      start,
-      launch(c) { noise(0.5, 0.22, 300, 2400 + 2600 * c, 2); tone(146.83, 293.66 * (1 + c), 0.45, 0.10, 'triangle'); },
-      found(yn) { const f = SCALE[Math.max(0, Math.min(5, Math.floor(yn * 6)))]; tone(f, f, 0.6, 0.22, 'triangle'); tone(f * 2, f * 2, 0.9, 0.10, 'sine', 0.03); noise(0.08, 0.12, 5000, 2000, 1); },
-      miss() { tone(110, 62, 0.22, 0.28, 'sine', 0, false); noise(0.1, 0.10, 900, 300, 1.5); },
-      dead() { tone(330, 41, 0.7, 0.26, 'sawtooth'); noise(0.5, 0.30, 2600, 120, 0.8); },
-      decohere() { for (let i = 0; i < 4; i++) tone(SCALE[i + 1], SCALE[i + 1] * 0.97, 0.3, 0.07, 'sine', i * 0.05); },
-      key() { tone(880, 880, 0.3, 0.16, 'triangle'); tone(1318.5, 1318.5, 0.6, 0.14, 'triangle', 0.09); },
-      win() { [293.66, 349.23, 440, 587.33, 880].forEach((f, i) => tone(f, f, 0.7, 0.16, 'triangle', i * 0.085)); noise(0.9, 0.08, 800, 6000, 1.2); },
-      step(c) { tone(196 + 60 * c, 196 + 60 * c, 0.05, 0.02, 'sine', 0, false); },
-      wave(bands, pan, on) {
-        if (!ok) return;
-        try {
-          const t = ac.currentTime;
-          for (let i = 0; i < 6; i++) {
-            const v = on && !muted ? Math.min(0.075, Math.sqrt(bands[i]) * 0.11) : 0;
-            voices[i].g.gain.setTargetAtTime(v, t, 0.09);
-            if (voices[i].p) voices[i].p.pan.setTargetAtTime(Math.max(-1, Math.min(1, pan)), t, 0.15);
-          }
-        } catch (err) { warn(err); }
-      },
-      toggle() { muted = !muted; if (ok) master.gain.setTargetAtTime(muted ? 0 : 0.8, ac.currentTime, 0.05); return muted; },
-      get muted() { return muted; },
-      info() { return { ok, state: ac ? ac.state : 'none', voices: voices.length, warned }; },
-    };
-  })();
-
-  // ---------------------------------------------------------------- state
+  // Everything about the current moment of play. The HUD and the tests read this.
   const S = {
-    scene: 'title', clock: 0, lvl: 0, t: 0, mode: 'particle', modeT: 0,
-    px: 0, py: 0, vx: 0, vy: 0, safeX: 0, safeY: 0,
-    charging: false, chargeT: 0, k: KMIN,
-    waveT: 0, norm: 1, surv: 1, fateRed: 0, fateGreen: 0, fateShow: 0,
-    lensOn: false, lensR: LENS0, lens: { x: 0, y: 0, r: LENS0, p: 0 }, lookCd: 0, safeDeaths: 0,
-    keys: [], exit: null, intro: 0, flash: 0, shake: 0, trans: null, acc: 0, spawnT: 0,
-    stats: { looks: 0, deaths: 0, time: 0, waves: 0, logw: 0 }, levelStats: null, toast: null,
+    scene: 'title',            // 'title' | 'play' | 'end'
+    clock: 0,                  // seconds since the page loaded
+    lvl: 0,
+    t: 0,                      // seconds in this room
+    mode: 'particle',          // 'particle' | 'wave' | 'dead' | 'won'
+    modeT: 0,                  // seconds in this mode
+    px: 0, py: 0, vx: 0, vy: 0,
+    safeX: 0, safeY: 0, safeDeaths: 0,   // respawn checkpoint
+    charging: false, chargeT: 0,
+    waveT: 0,                  // seconds as a wave
+    norm: 1,                   // probability left in the field
+    surv: 1,                   // chance this flight has not been caught yet
+    fateRed: 0, fateGreen: 0,  // chance each colour has caught this flight so far
+    fateShow: 0,               // seconds the fate bar stays up after a flight
+    lensOn: false, lensR: LENS.start,
+    lens: { x: 0, y: 0, r: LENS.start, p: 0 },   // the lens as last drawn: place, size, odds
+    lookCd: 0,
+    keys: [],
+    exit: null,                // centre of the exit, for labels
+    mark: null,                // where and how the last wave was launched
+    intro: 0,
+    flash: 0, shake: 0,
+    trans: null,               // a fade between scenes: { t, apply, done }
+    stats: freshStats(),
+    levelStats: { looks: 0, deaths: 0, t: 0 },
   };
-  const keys = {}; let mx = W * 0.6, my = H * 0.5, frameNo = 0;
-  const fx = [];
-  const ring = (x, y, r0, r1, life, color, lw = 0.7) => fx.push({ type: 0, x, y, r0, r1, life, t: 0, color, lw });
-  const burst = (x, y, n, color, sp = 40) => { for (let i = 0; i < n; i++) { const a = rnd() * TAU, s = sp * (0.3 + rnd()); fx.push({ type: 1, x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.4 + rnd() * 0.6, t: 0, color }); } };
-  const label = (x, y, text, color) => fx.push({ type: 2, x: Math.max(24, Math.min(W - 24, x)), y: Math.max(22, Math.min(H - 22, y)), text, life: 1.3, t: 0, color });
+
+  let stepBudget = 0;          // fractional physics steps carried between ticks
+  let tickCount = 0;
+  const ambientClock = { spawnIn: 0, steps: 0 };
+  const bands = new Float32Array(6);
 
   const level = () => levels[S.lvl];
-  const unlocked = () => S.keys.every(k => k.got);
-  const cell = (x, y) => Math.max(0, Math.min(H - 1, Math.round(y))) * W + Math.max(0, Math.min(W - 1, Math.round(x)));
+  const exitOpen = () => S.keys.every(k => k.got);
 
-  // offsets of the particle's body, for "is it touching red"
-  const BODY = []; { const r = Math.ceil(PR); for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) if (dx * dx + dy * dy <= PR * PR) BODY.push(dy * W + dx); }
-  function touchingRed(x, y) {
-    const c = cell(x, y), k = world.kind;
-    for (const o of BODY) { const i = c + o; if (i >= 0 && i < N && k[i] === RED) return true; }
-    for (const s of world.sweepers) if (Math.abs(x - s.cx) < s.w / 2 + PR - 0.5 && Math.abs(y - s.cy) < s.h / 2 + PR - 0.5) return true;
-    return false;
+  // ---------------------------------------------------------------- scenes
+
+  /** Fade to black, apply a change, fade back. Ignored while another fade is running. */
+  function transition(apply) {
+    if (!S.trans) S.trans = { t: 0, apply, done: false };
   }
 
-  function loadLevel(i) {
-    S.lvl = i; const lv = levels[i];
-    PSI_LEVELS.load(world, lv); bakeLevel();
+  function enterLevel(index) {
+    const lv = levels[index];
+    S.lvl = index;
+    loadLevel(world, lv);
     S.keys = lv.keys.map(([x, y]) => ({ x, y, got: false }));
-    let sx = 0, sy = 0, n = 0; for (const c of world.greenCells) { sx += c % W; sy += (c / W) | 0; n++; }
-    S.exit = n ? { x: sx / n, y: sy / n } : null;
-    S.px = S.safeX = lv.start[0]; S.py = S.safeY = lv.start[1]; S.vx = S.vy = 0; S.safeDeaths = 0; S.lens = { x: mx, y: my, r: LENS0, p: 0 };
-    S.mode = 'particle'; S.modeT = 0; S.t = 0; S.charging = false; S.lensOn = false; S.intro = 0; S.fateShow = 0; S.acc = 0;
-    S.levelStats = { looks: 0, deaths: 0, t: 0 }; fx.length = 0; dispMax = 1e-3; S.mark = null;
-  }
-  function go(fn) { if (!S.trans) S.trans = { t: 0, fn, done: false }; }
-  function begin() { go(() => { S.scene = 'play'; S.stats = { looks: 0, deaths: 0, time: 0, waves: 0, logw: 0 }; loadLevel(0); }); }
-  function nextLevel() { go(() => { if (S.lvl + 1 >= levels.length) { S.scene = 'end'; buildEnd(); } else loadLevel(S.lvl + 1); }); }
 
-  function buildTitle() {
-    world.reset();
-    try {
-      const c = document.createElement('canvas'); c.width = W; c.height = H; const g = c.getContext('2d');
-      g.fillStyle = '#fff'; g.textAlign = 'center'; g.textBaseline = 'alphabetic';
-      g.font = 'italic 104px Georgia, "Times New Roman", serif'; g.fillText('ψ', W / 2 + 2, 88);
-      const d = g.getImageData(0, 0, W, H).data;
-      for (let i = 0; i < N; i++) if (d[i * 4 + 3] > 110) world.kind[i] = WALL;
-    } catch (err) { world.wall(W / 2 - 3, 20, 6, 80); }
-    world.finalize(); bakeLevel(); world.clearPsi(); S.spawnT = 0; S.norm = 1; dispMax = 1e-3;
+    let sumX = 0, sumY = 0;
+    for (const i of world.greenCells) { sumX += cellX(i); sumY += cellY(i); }
+    S.exit = world.greenCells.length ? { x: sumX / world.greenCells.length, y: sumY / world.greenCells.length } : null;
+
+    S.px = S.safeX = lv.start[0];
+    S.py = S.safeY = lv.start[1];
+    S.vx = S.vy = 0;
+    S.safeDeaths = 0;
+    S.mode = 'particle'; S.modeT = 0; S.t = 0; S.intro = 0;
+    S.charging = false; S.lensOn = false;
+    S.lens = { x: pointer.x, y: pointer.y, r: LENS.start, p: 0 };
+    S.fateShow = 0; S.mark = null;
+    S.levelStats = { looks: 0, deaths: 0, t: 0 };
+    stepBudget = 0;
+    effects.clear();
   }
-  function buildEnd() {
-    world.reset();
-    for (let i = 0; i < 6; i++) world.disc(WALL, 30 + rnd() * (W - 60), 24 + rnd() * (H - 48), 4 + rnd() * 7);
-    world.finalize(); bakeLevel(); world.clearPsi(); S.spawnT = 0; S.norm = 1; dispMax = 1e-3;
+
+  function showTitle() {
+    S.scene = 'title';
+    buildTitleRoom(world);
+    ambientClock.spawnIn = 0; S.norm = 1;
   }
-  // the title and ending keep a few packets drifting around, purely for show
-  function ambient(dt) {
-    S.spawnT -= dt;
-    if (S.spawnT <= 0) {
-      S.spawnT = 4.2;
-      for (let tries = 0; tries < 40; tries++) {
-        const x = 16 + rnd() * (W - 32), y = 14 + rnd() * (H - 28);
-        if (!world.walk[cell(x, y)]) continue;
-        const a = Math.atan2(H / 2 - y, W / 2 - x) + (rnd() - 0.5) * 1.2, k = 0.75 + rnd() * 0.35;
-        world.scale(0.3);
-        world.packet(x, y, k * Math.cos(a), k * Math.sin(a), 5, true);
-        const n1 = world.norm(); if (n1 > 0) world.scale(1 / Math.sqrt(n1));
-        break;
-      }
+
+  function showEnding() {
+    S.scene = 'end';
+    buildEndRoom(world, random);
+    ambientClock.spawnIn = 0; S.norm = 1;
+  }
+
+  function startGame() {
+    transition(() => { S.scene = 'play'; S.stats = freshStats(); enterLevel(0); });
+  }
+
+  function nextLevel() {
+    transition(() => { if (S.lvl + 1 >= levels.length) showEnding(); else enterLevel(S.lvl + 1); });
+  }
+
+  // ---------------------------------------------------------------- being caught, dying, respawning
+
+  function touchingRed(x, y) {
+    const centre = clampCell(x, y);
+    for (const offset of BODY) {
+      const i = centre + offset;
+      if (i >= 0 && i < N && world.kind[i] === RED) return true;
     }
-    S.acc += dt * STEPS_PER_SEC * 0.8; const n = Math.min(40, Math.floor(S.acc)); S.acc -= n;
-    if (n > 0) world.step(n);
-    S.norm = world.norm();
-    if (S.norm > 1e-9 && (S.norm < 0.3 || S.norm > 3)) { world.scale(1 / Math.sqrt(S.norm)); S.norm = 1; }
-  }
-
-  // ---------------------------------------------------------------- rules
-  // A checkpoint is where you respawn. It is never placed inside a scanner's sweep, and one that
-  // kills a walker twice in a row is dropped for the level start, so respawning cannot loop.
-  function swept(x, y) {
-    for (const s of (level().sweepers || [])) if (Math.abs(x - s.x) < s.ax + s.w / 2 + PR + 1 && Math.abs(y - s.y) < s.ay + s.h / 2 + PR + 1) return true;
+    for (const s of world.sweepers) {
+      if (Math.abs(x - s.cx) < s.w / 2 + PARTICLE_RADIUS - 0.5 && Math.abs(y - s.cy) < s.h / 2 + PARTICLE_RADIUS - 0.5) return true;
+    }
     return false;
   }
-  function checkpoint(x, y) { if (!swept(x, y)) { S.safeX = x; S.safeY = y; S.safeDeaths = 0; } }
-  function charge() { return Math.min(1, S.chargeT / CHARGE_TIME); }
-  // heldMs is the real time between the press and release events. Using it (instead of counting
-  // ticks between frames) makes a hold of the same length launch the same wave at any refresh rate.
-  function launch(heldMs) {
-    if (heldMs >= 0) S.chargeT = heldMs / 1000;
-    const c = charge(), k = KMIN + (KMAX - KMIN) * c, a = Math.atan2(my - S.py, mx - S.px);
-    world.packet(S.px, S.py, k * Math.cos(a), k * Math.sin(a), LAUNCH_SIGMA);
-    S.mode = 'wave'; S.modeT = 0; S.waveT = 0; S.norm = world.norm(); S.surv = 1; S.fateRed = 0; S.fateGreen = 0; S.fateShow = 1e9;
-    checkpoint(S.px, S.py); S.charging = false; S.lensOn = false; S.lookCd = 0.15; S.acc = 0;
-    S.mark = { x: S.px, y: S.py, a, c };
-    S.stats.waves++; snd.launch(c);
-    ring(S.px, S.py, 2, 16, 0.5, 'rgba(160,220,255,', 0.6);
-  }
-  function materialize(i, text, color) {
-    S.px = i % W; S.py = (i / W) | 0; S.vx = S.vy = 0;
-    world.clearPsi(); S.fateShow = S.mode === 'wave' ? 1.6 : 0; S.mode = 'particle'; S.modeT = 0; S.charging = false; S.lensOn = false;
-    if (touchingRed(S.px, S.py)) { die(S.px, S.py, 'FOUND ON RED'); return; }
-    checkpoint(S.px, S.py);
-    ring(S.px, S.py, 26, 3, 0.35, color, 0.9); ring(S.px, S.py, 3, 12, 0.6, color, 0.5);
-    label(S.px, S.py - 9, text, color); S.flash = Math.max(S.flash, 0.10);
-  }
-  function die(x, y, text) {
-    if (S.mode === 'particle' && ++S.safeDeaths >= 2) { const st = level().start; S.safeX = st[0]; S.safeY = st[1]; S.safeDeaths = 0; }
-    S.fateShow = S.mode === 'wave' ? 1.6 : 0; S.mode = 'dead'; S.modeT = 0; S.charging = false; S.lensOn = false;
-    world.clearPsi(); S.stats.deaths++; S.levelStats.deaths++;
-    burst(x, y, 46, 'rgba(255,90,110,', 70); ring(x, y, 2, 30, 0.6, 'rgba(255,80,100,', 1.2);
-    label(x, y - 8, text, 'rgba(255,120,135,'); S.shake = 1; S.flash = Math.max(S.flash, 0.18); snd.dead();
-  }
-  function win(x, y) {
-    S.fateShow = S.mode === 'wave' ? 2 : 0; S.mode = 'won'; S.modeT = 0; S.charging = false; S.lensOn = false;
-    world.clearPsi(); S.px = x; S.py = y;
-    burst(x, y, 60, 'rgba(120,255,190,', 60);
-    for (let i = 0; i < 3; i++) fx.push({ type: 0, x, y, r0: 2, r1: 40 + i * 22, life: 0.9 + i * 0.25, t: -i * 0.12, color: 'rgba(120,255,190,', lw: 1 });
-    label(x, y - 9, 'FOUND', 'rgba(150,255,205,'); S.flash = Math.max(S.flash, 0.3); snd.win();
-  }
-  function decohere() {
-    const i = world.nearestWalk(world.sample(rnd()));
-    if (i < 0) { materialize(cell(S.safeX, S.safeY), 'DECOHERED', 'rgba(200,200,255,'); return; }
-    snd.decohere(); materialize(i, 'DECOHERED', 'rgba(200,200,255,');
-  }
-  function look() {
-    // Use the lens as it was last drawn (place, size, odds), not wherever the pointer is at release.
-    // The field has not moved since that tick, so the number shown is the number rolled.
-    const { x: mx, y: my, r, p } = S.lens;
-    S.lensOn = false; S.lookCd = 0.22; S.stats.looks++; S.levelStats.looks++;
-    if (rnd() < p) {
-      const i = world.nearestWalk(world.sample(rnd(), mx, my, r));
-      S.stats.logw += Math.log10(Math.max(p, 1e-9));
-      if (i < 0) { decohere(); return; }
-      snd.found(((i / W) | 0) / H); materialize(i, 'FOUND', 'rgba(170,235,255,');
-    } else {
-      S.stats.logw += Math.log10(Math.max(1 - p, 1e-9));
-      world.lensFail(mx, my, r); S.norm = world.norm();
-      ring(mx, my, r, r * 0.55, 0.35, 'rgba(255,255,255,', 0.6); label(mx, my - r - 4, 'NOT HERE', 'rgba(210,215,235,'); snd.miss();
-      if (S.norm < 1e-9) materialize(cell(S.safeX, S.safeY), 'DECOHERED', 'rgba(200,200,255,');
+
+  /** True anywhere a scanner passes over during its cycle. */
+  function insideSweep(x, y) {
+    for (const s of level().sweepers || []) {
+      if (Math.abs(x - s.x) < s.ax + s.w / 2 + PARTICLE_RADIUS + 1 && Math.abs(y - s.y) < s.ay + s.h / 2 + PARTICLE_RADIUS + 1) return true;
     }
+    return false;
   }
 
-  function moveParticle(dt) {
-    let ix = (keys.right ? 1 : 0) - (keys.left ? 1 : 0), iy = (keys.down ? 1 : 0) - (keys.up ? 1 : 0);
-    const l = Math.hypot(ix, iy) || 1; ix /= l; iy /= l;
-    const f = Math.min(1, dt * 16); S.vx += (ix * SPEED - S.vx) * f; S.vy += (iy * SPEED - S.vy) * f;
-    let dx = S.vx * dt, dy = S.vy * dt; const steps = Math.max(1, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / 0.5));
-    dx /= steps; dy /= steps;
-    for (let s = 0; s < steps; s++) {
-      if (world.walk[cell(S.px + dx, S.py)]) S.px += dx; else S.vx = 0;
-      if (world.walk[cell(S.px, S.py + dy)]) S.py += dy; else S.vy = 0;
-    }
-  }
-  const bands = new Float32Array(6);
-  function listen() {
-    const R = world.R, I = world.I; bands.fill(0); let sx = 0, tot = 0;
-    for (let y = 0; y < H; y += 2) { const b = (y * 6 / H) | 0; for (let x = 0, i = y * W; x < W; x += 2, i += 2) { const p = R[i] * R[i] + I[i] * I[i]; bands[b] += p; sx += p * x; tot += p; } }
-    if (tot > 0) { for (let i = 0; i < 6; i++) bands[i] /= tot; snd.wave(bands, (sx / tot / W) * 2 - 1, true); }
+  // A checkpoint is where you respawn. It is never placed inside a scanner's sweep, and one that
+  // kills a walker twice in a row is dropped for the room's start, so respawning cannot loop.
+  function checkpoint(x, y) {
+    if (insideSweep(x, y)) return;
+    S.safeX = x; S.safeY = y; S.safeDeaths = 0;
   }
 
-  function updatePlay(dt) {
-    const lv = level();
-    S.t += dt; S.modeT += dt; S.intro += dt; S.stats.time += dt; S.levelStats.t += dt;
-    if (S.lookCd > 0) S.lookCd -= dt;
-    if (S.fateShow < 1e8) S.fateShow -= dt;
-    PSI_LEVELS.sweep(world, lv, S.t);
-
-    if (S.mode === 'particle') {
-      moveParticle(dt);
-      if (touchingRed(S.px, S.py)) { die(S.px, S.py, 'DETECTED'); return; }
-      for (const k of S.keys) if (!k.got && Math.hypot(k.x - S.px, k.y - S.py) < 6) {
-        k.got = true; snd.key(); burst(k.x, k.y, 24, 'rgba(255,220,120,', 40); ring(k.x, k.y, 2, 18, 0.5, 'rgba(255,220,120,', 0.8);
-        if (unlocked() && S.exit) { label(S.exit.x, S.exit.y, 'EXIT AWAKE', 'rgba(150,255,205,'); }
-      }
-      if (unlocked() && world.kind[cell(S.px, S.py)] === GREEN) { S.stats.logw += 0; win(S.px, S.py); return; }
-      if (S.charging) S.chargeT += dt;
-      // the particle is drawn as a tight packet; charging spreads it and shows its wavelength
-      const c = charge(), k = S.charging ? KMIN + (KMAX - KMIN) * c : 0, a = Math.atan2(my - S.py, mx - S.px);
-      const grow = S.charging ? Math.min(1, S.chargeT / 0.22) : 0;
-      world.packet(S.px, S.py, k * Math.cos(a), k * Math.sin(a), IDLE_SIGMA + (LAUNCH_SIGMA - IDLE_SIGMA) * grow * grow * (3 - 2 * grow), false, -S.t * (1.5 + 5 * k));
-      S.norm = world.norm();
-      if ((frameNo & 3) === 0) snd.wave(bands, 0, false);
-    } else if (S.mode === 'wave') {
-      S.waveT += dt;
-      S.acc += dt * STEPS_PER_SEC; const n = Math.min(40, Math.floor(S.acc)); S.acc -= n;
-      if (n > 0) {
-        world.step(n);
-        const ab = world.absorb(n, unlocked()), after = world.norm(), before = after + ab.red + ab.green;
-        if (before < 1e-9) { materialize(cell(S.safeX, S.safeY), 'DECOHERED', 'rgba(200,200,255,'); return; }
-        const pG = ab.green / before, pR = ab.red / before, u = rnd();
-        S.fateGreen += S.surv * pG; S.fateRed += S.surv * pR; S.surv *= Math.max(0, 1 - pG - pR);
-        if (u < pG) { const i = world.lastGreenCell; S.stats.logw += Math.log10(Math.max(S.fateGreen, 1e-9)); win(i >= 0 ? i % W : S.exit.x, i >= 0 ? (i / W) | 0 : S.exit.y); return; }
-        if (u < pG + pR) { const i = world.lastRedCell; S.stats.logw += Math.log10(Math.max(S.fateRed, 1e-9)); die(i >= 0 ? i % W : S.px, i >= 0 ? (i / W) | 0 : S.py, 'DETECTED'); return; }
-        S.norm = after;
-        if (after < 0.25) { world.scale(1 / Math.sqrt(after)); S.norm = world.norm(); }
-      }
-      if (S.lensOn) S.lensR = Math.min(LENS_MAX, S.lensR + LENS_GROW * dt);
-      { const r = S.lensOn ? S.lensR : LENS0; S.lens = { x: mx, y: my, r, p: S.norm > 0 ? Math.min(1, world.lensMass(mx, my, r) / S.norm) : 0 }; }
-      if ((frameNo & 3) === 0) listen();
-      if (S.waveT > (lv.coherence || COHERENCE)) { decohere(); return; }
-    } else if (S.mode === 'dead') {
-      S.norm = world.norm(); snd.wave(bands, 0, false);
-      if (S.modeT > 0.75 && S.modeT > 6) { S.safeX = lv.start[0]; S.safeY = lv.start[1]; }
-      if (S.modeT > 0.75 && !touchingRed(S.safeX, S.safeY)) { S.px = S.safeX; S.py = S.safeY; S.mode = 'particle'; S.modeT = 0; S.vx = S.vy = 0; ring(S.px, S.py, 20, 3, 0.35, 'rgba(170,235,255,', 0.8); }
-    } else if (S.mode === 'won') {
-      S.norm = world.norm(); snd.wave(bands, 0, false);
-      if (S.modeT > 1.5) nextLevel();
-    }
-  }
-
-  function update(dt) {
-    S.clock += dt; frameNo++;
-    S.flash = Math.max(0, S.flash - dt * 1.4); S.shake = Math.max(0, S.shake - dt * 3);
-    if (S.trans) { S.trans.t += dt; if (!S.trans.done && S.trans.t >= 0.35) { S.trans.done = true; S.trans.fn(); } if (S.trans.t >= 0.75) S.trans = null; }
-    if (S.scene === 'play') updatePlay(dt); else ambient(dt);
-    for (let i = fx.length - 1; i >= 0; i--) { const f = fx[i]; f.t += dt; if (f.type === 1) { f.x += f.vx * dt; f.y += f.vy * dt; f.vx *= 1 - 2.5 * dt; f.vy *= 1 - 2.5 * dt; } if (f.t >= f.life) fx.splice(i, 1); }
-  }
-
-  // ---------------------------------------------------------------- overlay
-  function text(str, x, y, size, color, align = 'left', weight = 400, spacing = 0, maxW = 0) {
-    ui.font = `${weight} ${size * TS}px ${FONT}`; ui.textAlign = align; ui.textBaseline = 'middle';
-    if ('letterSpacing' in ui) ui.letterSpacing = spacing + 'px';
-    ui.fillStyle = color; if (maxW) ui.fillText(str, x, y, maxW); else ui.fillText(str, x, y);
-  }
-  function pill(x, y, w, h, color) { ui.fillStyle = color; ui.beginPath(); if (ui.roundRect) ui.roundRect(x, y, w, h, h / 2); else ui.rect(x, y, w, h); ui.fill(); }
-  const pct = p => p < 0.005 ? '<1%' : p > 0.995 ? '>99%' : Math.round(p * 100) + '%';
-
-  function drawFx() {
-    for (const f of fx) {
-      if (f.t < 0) continue; const u = f.t / f.life;
-      if (f.type === 0) { ui.strokeStyle = f.color + (1 - u) * 0.9 + ')'; ui.lineWidth = f.lw; ui.beginPath(); ui.arc(f.x, f.y, f.r0 + (f.r1 - f.r0) * (1 - (1 - u) * (1 - u)), 0, TAU); ui.stroke(); }
-      else if (f.type === 1) { ui.fillStyle = f.color + (1 - u) + ')'; ui.fillRect(f.x - 0.4, f.y - 0.4, 0.9, 0.9); }
-      else { text(f.text, f.x, f.y - u * 6, 3.6, f.color + Math.min(1, (1 - u) * 2.2) + ')', 'center', 700, 0.5); }
-    }
-  }
-  function drawPlay() {
-    const lv = level(), open = unlocked();
-    // keys
-    for (const k of S.keys) if (!k.got) {
-      const b = Math.sin(S.clock * 3) * 0.8;
-      ui.save(); ui.translate(k.x, k.y + b); ui.rotate(S.clock * 1.2);
-      ui.strokeStyle = 'rgba(255,220,120,0.95)'; ui.lineWidth = 0.7; ui.strokeRect(-2.2, -2.2, 4.4, 4.4);
-      ui.rotate(-S.clock * 2.4); ui.fillStyle = 'rgba(255,235,170,0.95)'; ui.fillRect(-1, -1, 2, 2); ui.restore();
-      ui.strokeStyle = 'rgba(255,220,120,0.25)'; ui.lineWidth = 0.4; ui.beginPath(); ui.arc(k.x, k.y, 6 + Math.sin(S.clock * 2) * 0.6, 0, TAU); ui.stroke();
-    }
-    if (S.exit && !open) text('ASLEEP', S.exit.x, S.exit.y, 3.2, 'rgba(200,205,220,0.55)', 'center', 700, 0.8);
-
-    if (lv.spots && (S.levelStats.deaths >= 2 || S.levelStats.t > 40) && S.mode !== 'won') {
-      // stuck on this room: mark where to stand and where to aim
-      const a = 0.45 + 0.25 * Math.sin(S.clock * 3);
-      ui.strokeStyle = `rgba(255,230,150,${a})`; ui.lineWidth = 0.5; ui.setLineDash([1.4, 1.2]);
-      for (const [x, y] of lv.spots) { ui.beginPath(); ui.arc(x, y, PR + 2.5, 0, TAU); ui.moveTo(x, y); ui.lineTo(lv.aimAt[0], lv.aimAt[1]); ui.stroke(); }
-      ui.setLineDash([]);
-      text('stand on a ring, aim along its line, full charge', lv.spots[0][0], lv.spots[0][1] - 10, 2.6, `rgba(255,230,150,${a + 0.25})`, 'center', 700);
-    }
-    if (S.mark && S.mode !== 'won') {
-      // where and how the last wave was launched, so a shot can be repeated or nudged
-      const m = S.mark; ui.strokeStyle = 'rgba(190,210,255,0.32)'; ui.lineWidth = 0.35; ui.setLineDash([0.9, 1.3]);
-      ui.beginPath(); ui.arc(m.x, m.y, PR + 1.2, 0, TAU); ui.moveTo(m.x + Math.cos(m.a) * 6, m.y + Math.sin(m.a) * 6); ui.lineTo(m.x + Math.cos(m.a) * (12 + 10 * m.c), m.y + Math.sin(m.a) * (12 + 10 * m.c)); ui.stroke(); ui.setLineDash([]);
-    }
-    if (S.mode === 'particle') {
-      const a = Math.atan2(my - S.py, mx - S.px), c = charge();
-      // aim
-      ui.strokeStyle = `rgba(190,225,255,${S.charging ? 0.75 : 0.3})`; ui.lineWidth = 0.45; ui.setLineDash([1.2, 1.6]); ui.lineDashOffset = -S.clock * 6;
-      ui.beginPath(); ui.moveTo(S.px + Math.cos(a) * 6, S.py + Math.sin(a) * 6); ui.lineTo(S.px + Math.cos(a) * (18 + 22 * (S.charging ? c : 0)), S.py + Math.sin(a) * (18 + 22 * (S.charging ? c : 0))); ui.stroke(); ui.setLineDash([]);
-      // body
-      ui.fillStyle = 'rgba(255,255,255,0.95)'; ui.beginPath(); ui.arc(S.px, S.py, 1.5, 0, TAU); ui.fill();
-      ui.strokeStyle = 'rgba(210,235,255,0.55)'; ui.lineWidth = 0.4; ui.beginPath(); ui.arc(S.px, S.py, PR, 0, TAU); ui.stroke();
-      if (S.charging) {
-        ui.strokeStyle = 'rgba(255,255,255,0.18)'; ui.lineWidth = 1.1; ui.beginPath(); ui.arc(S.px, S.py, 13, 0, TAU); ui.stroke();
-        ui.strokeStyle = c >= 1 ? `rgba(255,240,170,${0.75 + 0.25 * Math.sin(S.clock * 18)})` : 'rgba(150,225,255,0.95)';
-        ui.beginPath(); ui.arc(S.px, S.py, 13, -Math.PI / 2, -Math.PI / 2 + TAU * c); ui.stroke();
-        text(c >= 1 ? 'FULL' : 'CHARGE', S.px, S.py - 18, 3, c >= 1 ? 'rgba(255,240,170,0.95)' : 'rgba(190,225,255,0.8)', 'center', 700, 0.6);
-      }
-      // reticle
-      ui.strokeStyle = 'rgba(220,235,255,0.7)'; ui.lineWidth = 0.4; ui.beginPath();
-      ui.moveTo(mx - 3, my); ui.lineTo(mx - 1, my); ui.moveTo(mx + 1, my); ui.lineTo(mx + 3, my); ui.moveTo(mx, my - 3); ui.lineTo(mx, my - 1); ui.moveTo(mx, my + 1); ui.lineTo(mx, my + 3); ui.stroke();
-    } else if (S.mode === 'wave') {
-      const { x: mx, y: my, r, p } = S.lens, hot = Math.min(1, p * 2.2);
-      ui.strokeStyle = `rgba(${200 + 55 * hot | 0},${225 + 20 * hot | 0},255,${0.45 + 0.5 * hot})`; ui.lineWidth = S.lensOn ? 0.8 : 0.5;
-      ui.beginPath(); ui.arc(mx, my, r, 0, TAU); ui.stroke();
-      ui.setLineDash([0.8, 2.2]); ui.lineDashOffset = S.clock * 5; ui.strokeStyle = 'rgba(220,235,255,0.35)'; ui.beginPath(); ui.arc(mx, my, r + 2.2, 0, TAU); ui.stroke(); ui.setLineDash([]);
-      const ty = my - r - 5 < 10 ? my + r + 5 : my - r - 5;
-      text(pct(p), mx, ty, 4.4, `rgba(255,255,255,${0.6 + 0.4 * hot})`, 'center', 700);
-      if (S.waveT < 2.2 && S.lvl >= 2 && S.stats.looks < 3 && !S.lensOn) text('click to look · hold to widen', mx, ty + (ty < my ? -5 : 5), 2.7, 'rgba(200,215,240,0.6)', 'center');
-    }
-    drawFx();
-
-    // HUD
-    const num = String(S.lvl + 1).padStart(2, '0');
-    text(`${num}/${String(levels.length).padStart(2, '0')}`, 8, 9, 3.4, 'rgba(160,175,210,0.8)', 'left', 700, 0.4);
-    text(lv.name, 27, 9, 3.4, 'rgba(235,240,255,0.95)', 'left', 700, 1.2);
-    let hud = `looks ${S.stats.looks}   deaths ${S.stats.deaths}`;
-    if (S.keys.length) hud = `keys ${S.keys.filter(k => k.got).length}/${S.keys.length}   ` + hud;
-    text(hud, W - 8, 9, 3, 'rgba(160,175,210,0.8)', 'right', 400, 0.2);
-
-    // fate: how much of you each colour has claimed during this flight
-    if (S.mode === 'wave' || S.fateShow > 0) {
-      const a = S.mode === 'wave' ? 1 : Math.min(1, S.fateShow), bw = 92, x0 = W / 2 - bw / 2, y0 = 7.6;
-      pill(x0 - 1, y0 - 1, bw + 2, 4.2, `rgba(10,12,24,${0.7 * a})`);
-      ui.fillStyle = `rgba(90,100,130,${0.5 * a})`; ui.fillRect(x0, y0, bw, 2.2);
-      ui.fillStyle = `rgba(90,255,170,${0.95 * a})`; ui.fillRect(x0, y0, bw * Math.min(1, S.fateGreen), 2.2);
-      ui.fillStyle = `rgba(255,80,105,${0.95 * a})`; ui.fillRect(x0 + bw * (1 - Math.min(1, S.fateRed)), y0, bw * Math.min(1, S.fateRed), 2.2);
-      text('exit ' + pct(S.fateGreen), x0, y0 + 6.2, 2.7, `rgba(140,255,195,${0.9 * a})`, 'left', 700);
-      text(pct(S.fateRed) + ' caught', x0 + bw, y0 + 6.2, 2.7, `rgba(255,130,150,${0.9 * a})`, 'right', 700);
-      if (S.mode === 'wave') {
-        const left = Math.max(0, 1 - S.waveT / (lv.coherence || COHERENCE));
-        ui.fillStyle = `rgba(200,210,255,${left < 0.25 ? 0.5 + 0.4 * Math.sin(S.clock * 14) : 0.55})`; ui.fillRect(W / 2 - bw / 2 * left, y0 + 3.2, bw * left, 0.5);
-        text('coherence', W / 2, y0 + 6.2, 2.4, 'rgba(180,190,225,0.6)', 'center');
-      }
-    }
-    // hint
-    const ha = S.intro < 1 ? S.intro : 1;
-    ui.font = `700 ${3.3 * TS}px ${FONT}`; if ('letterSpacing' in ui) ui.letterSpacing = '0.15px';
-    const lines = lv.hint, lh = 5.2 * TS, wmax = Math.min(W - 16, Math.max(...lines.map(s => ui.measureText(s).width)));
-    pill(W / 2 - wmax / 2 - 5, H - 8.5 - lines.length * lh, wmax + 10, lines.length * lh + 3, `rgba(6,8,18,${0.72 * ha})`);
-    lines.forEach((s, i) => { text(s, W / 2, H - 9.4 - (lines.length - 1 - i) * lh, 3.3, i === 0 ? `rgba(240,244,255,${0.95 * ha})` : `rgba(170,185,220,${0.9 * ha})`, 'center', i === 0 ? 700 : 400, 0.15, W - 16); });
-    // level card
-    if (S.intro < 1.9) {
-      const a = Math.min(1, S.intro * 3) * Math.min(1, (1.9 - S.intro) * 1.8);
-      text(num, W / 2, H / 2 - 13, 5, `rgba(150,170,215,${0.8 * a})`, 'center', 400, 2);
-      text(lv.name, W / 2 + 2, H / 2 - 2, 13, `rgba(255,255,255,${0.92 * a})`, 'center', 700, 4);
-    }
-    if (S.mode === 'won') {
-      const a = Math.min(1, S.modeT * 3);
-      text(`${S.levelStats.t.toFixed(1)}s   ${S.levelStats.looks} looks   ${S.levelStats.deaths} deaths`, W / 2, H / 2 + 12, 3.6, `rgba(190,255,220,${0.9 * a})`, 'center', 400, 0.4);
-    }
-    // nobody should be stranded on one room: after a while, say that it can be skipped
-    const stuck = S.levelStats.deaths >= 4 || S.levelStats.t > 75;
-    text((snd.muted ? 'R restart · M sound on' : 'R restart · M mute') + (stuck ? ' · ] skip this room' : ''), 8, 14.6, 2.4, stuck ? 'rgba(190,205,240,0.85)' : 'rgba(130,145,180,0.6)', 'left');
-  }
-  function worlds() {
-    const e = -S.stats.logw;
-    if (e < 0.05) return 'every world';
-    if (e < 6) return '1 in ' + Math.round(Math.pow(10, e)).toLocaleString('en-US') + ' worlds';
-    return '1 in 10^' + e.toFixed(1) + ' worlds';
-  }
-  function drawTitle() {
-    drawFx();
-    const a = 0.55 + 0.45 * Math.sin(S.clock * 2.4);
-    pill(W / 2 - 74, 110, 148, 28, 'rgba(5,7,16,0.62)');
-    text('a game about being found', W / 2, 116, 5.2, 'rgba(240,244,255,0.95)', 'center', 700, 1.4);
-    text('You are a particle until you choose to be a wave.', W / 2, 124, 3.1, 'rgba(175,190,225,0.9)', 'center', 400, 0.2);
-    text('click to begin', W / 2, 132, 3.4, `rgba(150,225,255,${a})`, 'center', 700, 1.2);
-    text('a real Schrödinger equation is running behind this text', W / 2, 7, 2.6, 'rgba(165,180,215,0.8)', 'center', 400, 0.3);
-  }
-  function drawEnd() {
-    drawFx();
-    const st = S.stats, m = Math.floor(st.time / 60), s = Math.floor(st.time % 60);
-    ui.fillStyle = 'rgba(5,7,16,0.84)'; ui.beginPath(); if (ui.roundRect) ui.roundRect(W / 2 - 88, 34, 176, 80, 5); else ui.rect(W / 2 - 88, 34, 176, 80); ui.fill();
-    ui.strokeStyle = 'rgba(150,170,230,0.25)'; ui.lineWidth = 0.4; ui.stroke();
-    text('YOU WERE FOUND', W / 2 + 2, 48, 10, 'rgba(255,255,255,0.96)', 'center', 700, 3);
-    text(`${m}:${String(s).padStart(2, '0')}    ${st.waves} waves    ${st.looks} looks    ${st.deaths} deaths`, W / 2, 62, 3.6, 'rgba(190,255,220,0.92)', 'center', 400, 0.4);
-    text('This exact run happens in', W / 2, 75, 3.2, 'rgba(175,190,225,0.9)', 'center');
-    text(worlds(), W / 2, 83, 6, 'rgba(150,225,255,0.98)', 'center', 700, 0.8);
-    text('Every other you is still out there, somewhere in the wave.', W / 2, 92, 3.2, 'rgba(175,190,225,0.9)', 'center');
-    text('click to play again', W / 2, 104, 3.4, `rgba(150,225,255,${0.55 + 0.45 * Math.sin(S.clock * 2.4)})`, 'center', 700, 1.2);
-  }
-
-  function render(dt) {
-    resize();
-    const locked = S.scene === 'play' && !unlocked();
-    drawWorld(dt, locked);
-    const sc = uic.width / W;
-    ui.setTransform(1, 0, 0, 1, 0, 0); ui.clearRect(0, 0, uic.width, uic.height);
-    const sh = S.shake * S.shake * 1.6;
-    ui.setTransform(sc, 0, 0, sc, (Math.random() - 0.5) * sh * sc, (Math.random() - 0.5) * sh * sc);
-    if (S.scene === 'play') drawPlay(); else if (S.scene === 'title') drawTitle(); else drawEnd();
-    if (S.trans) { const t = S.trans.t, a = t < 0.35 ? t / 0.35 : 1 - (t - 0.35) / 0.4; ui.setTransform(1, 0, 0, 1, 0, 0); ui.fillStyle = `rgba(4,5,10,${Math.max(0, Math.min(1, a))})`; ui.fillRect(0, 0, uic.width, uic.height); }
-  }
-
-  // ---------------------------------------------------------------- input
-  let pressTs = -1;
-  function press(ts) {
-    pressTs = ts >= 0 ? ts : -1;
-    snd.start();
-    if (S.trans) return;
-    if (S.scene === 'title') { begin(); return; }
-    if (S.scene === 'end') { go(() => { S.scene = 'title'; buildTitle(); }); return; }
-    if (S.mode === 'particle') { S.charging = true; S.chargeT = 0; }
-    else if (S.mode === 'wave' && S.lookCd <= 0) { S.lensOn = true; S.lensR = LENS0; }
-  }
-  function release(ts) {
-    const heldMs = ts >= 0 && pressTs >= 0 ? ts - pressTs : -1;
-    if (S.scene !== 'play' || S.trans) { S.charging = false; S.lensOn = false; return; }
-    if (S.mode === 'particle' && S.charging) launch(heldMs);
-    else if (S.mode === 'wave' && S.lensOn) look();
+  function endFlight(showFateFor) {
+    S.fateShow = S.mode === 'wave' ? showFateFor : 0;
     S.charging = false; S.lensOn = false;
   }
-  function pointer(e) { const r = stage.getBoundingClientRect(); mx = (e.clientX - r.left) / r.width * W; my = (e.clientY - r.top) / r.height * H; }
-  stage.addEventListener('pointermove', pointer);
-  stage.addEventListener('pointerdown', e => { e.preventDefault(); stage.focus(); pointer(e); if (stage.setPointerCapture) try { stage.setPointerCapture(e.pointerId); } catch (err) { } press(e.timeStamp); });
-  stage.addEventListener('pointerup', e => { pointer(e); release(e.timeStamp); });
-  stage.addEventListener('pointercancel', () => { S.charging = false; S.lensOn = false; });
-  stage.addEventListener('contextmenu', e => e.preventDefault());
-  const KEYMAP = { ArrowLeft: 'left', KeyA: 'left', ArrowRight: 'right', KeyD: 'right', ArrowUp: 'up', KeyW: 'up', ArrowDown: 'down', KeyS: 'down' };
-  window.addEventListener('keydown', e => {
-    if (e.metaKey || e.ctrlKey || e.altKey) return;
-    const k = KEYMAP[e.code];
-    if (k) { keys[k] = true; e.preventDefault(); snd.start(); return; }
-    if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); if (!e.repeat) press(e.timeStamp); return; }
-    if (e.repeat) return;
-    if (e.code === 'KeyM') snd.toggle();
-    else if (S.scene === 'play' && !S.trans) {
-      if (e.code === 'KeyR') go(() => loadLevel(S.lvl));
-      else if (e.code === 'BracketRight') nextLevel();
-      else if (e.code === 'BracketLeft' && S.lvl > 0) go(() => loadLevel(S.lvl - 1));
-    }
-  });
-  window.addEventListener('keyup', e => { const k = KEYMAP[e.code]; if (k) keys[k] = false; if (e.code === 'Space' || e.code === 'Enter') release(e.timeStamp); });
-  window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; S.charging = false; S.lensOn = false; });
-  window.addEventListener('resize', resize);
 
-  // ---------------------------------------------------------------- test hooks (?lvl= ?auto= ?fixed ?stop= ?dbg ?nogl ?seed=)
-  const FIXED = Q.has('fixed'), FIXED_DT = 1 / (+Q.get('fixed') || 60), STOP = Q.has('stop') ? +Q.get('stop') : Infinity;
-  const script = (Q.get('auto') || '').split(',').filter(Boolean).map(s => { const p = s.split(':'); return { t: +p[0], cmd: p[1], a: p.slice(2) }; }).sort((a, b) => a.t - b.t);
-  function runScript() {
-    while (script.length && script[0].t <= S.clock) {
-      const { cmd, a } = script.shift();
-      if (cmd === 'm') { mx = +a[0]; my = +a[1]; }
-      else if (cmd === 'd') press(); else if (cmd === 'u') release();
-      else if (cmd === 'tp') { S.px = +a[0]; S.py = +a[1]; }
-      else if (cmd === 'key') keys[a[0]] = a[1] === '1';
-      else if (cmd === 'lvl') loadLevel(+a[0] - 1);
-      else if (cmd === 'end') { S.scene = 'end'; buildEnd(); }
-      else if (cmd === 'allkeys') S.keys.forEach(k => k.got = true);
+  /** Become a particle at a cell. */
+  function materialize(cellIndex, word, color) {
+    endFlight(1.6);
+    S.px = cellX(cellIndex); S.py = cellY(cellIndex);
+    S.vx = S.vy = 0;
+    world.clearPsi();
+    S.mode = 'particle'; S.modeT = 0;
+    if (touchingRed(S.px, S.py)) { die(S.px, S.py, 'FOUND ON RED'); return; }
+    checkpoint(S.px, S.py);
+    effects.ring(S.px, S.py, 26, 3, 0.35, color, 0.9);
+    effects.ring(S.px, S.py, 3, 12, 0.6, color, 0.5);
+    effects.label(S.px, S.py - 9, word, color);
+    S.flash = Math.max(S.flash, 0.10);
+  }
+
+  function die(x, y, word) {
+    if (S.mode === 'particle' && ++S.safeDeaths >= 2) {
+      [S.safeX, S.safeY] = level().start;
+      S.safeDeaths = 0;
+    }
+    endFlight(1.6);
+    S.mode = 'dead'; S.modeT = 0;
+    world.clearPsi();
+    S.stats.deaths++; S.levelStats.deaths++;
+    effects.burst(x, y, 46, COLOR.death, 70);
+    effects.ring(x, y, 2, 30, 0.6, 'rgba(255,80,100,', 1.2);
+    effects.label(x, y - 8, word, COLOR.deathText);
+    S.shake = 1;
+    S.flash = Math.max(S.flash, 0.18);
+    audio.dead();
+  }
+
+  function win(x, y) {
+    endFlight(2);
+    S.mode = 'won'; S.modeT = 0;
+    world.clearPsi();
+    S.px = x; S.py = y;
+    effects.burst(x, y, 60, COLOR.exit, 60);
+    for (let i = 0; i < 3; i++) effects.ring(x, y, 2, 40 + i * 22, 0.9 + i * 0.25, COLOR.exit, 1, i * 0.12);
+    effects.label(x, y - 9, 'FOUND', COLOR.exitText);
+    S.flash = Math.max(S.flash, 0.3);
+    audio.win();
+  }
+
+  const respawnAtCheckpoint = () => materialize(clampCell(S.safeX, S.safeY), 'DECOHERED', COLOR.decohered);
+
+  /** Coherence ran out: the room measures you, somewhere the wave was. */
+  function decohere() {
+    const cell = world.nearestWalk(world.sample(random()));
+    if (cell < 0) { respawnAtCheckpoint(); return; }
+    audio.decohere();
+    materialize(cell, 'DECOHERED', COLOR.decohered);
+  }
+
+  // ---------------------------------------------------------------- the player's two actions
+
+  const charge = () => Math.min(1, S.chargeT / CHARGE.time);
+
+  /**
+   * Become a wave. heldMs is the real time between the press and release events; using it, rather
+   * than counting ticks between frames, makes equal holds launch equal waves at any refresh rate.
+   */
+  function launch(heldMs) {
+    if (heldMs >= 0) S.chargeT = heldMs / 1000;
+    const c = charge(), k = momentum(c);
+    const aim = Math.atan2(pointer.y - S.py, pointer.x - S.px);
+    world.packet(S.px, S.py, k * Math.cos(aim), k * Math.sin(aim), PLAYER.launchSigma);
+    S.mode = 'wave'; S.modeT = 0; S.waveT = 0;
+    S.norm = world.norm();
+    S.surv = 1; S.fateRed = 0; S.fateGreen = 0; S.fateShow = Infinity;
+    checkpoint(S.px, S.py);
+    S.charging = false; S.lensOn = false;
+    S.lookCd = 0.15;
+    S.mark = { x: S.px, y: S.py, aim, charge: c };
+    stepBudget = 0;
+    S.stats.waves++;
+    audio.launch(c);
+    effects.ring(S.px, S.py, 2, 16, 0.5, COLOR.launch, 0.6);
+  }
+
+  /**
+   * Look for yourself. This uses the lens as it was last drawn (place, size, odds), not wherever the
+   * pointer is at release; the field has not moved since that tick, so the odds shown are the odds rolled.
+   */
+  function look() {
+    const { x, y, r, p } = S.lens;
+    S.lensOn = false;
+    S.lookCd = LENS.cooldown;
+    S.stats.looks++; S.levelStats.looks++;
+    if (random() < p) {
+      S.stats.logw += Math.log10(Math.max(p, 1e-9));
+      const cell = world.nearestWalk(world.sample(random(), x, y, r));
+      if (cell < 0) { decohere(); return; }
+      audio.found(cellY(cell) / H);
+      materialize(cell, 'FOUND', COLOR.found);
+    } else {
+      S.stats.logw += Math.log10(Math.max(1 - p, 1e-9));
+      world.lensFail(x, y, r);     // you are certainly not there: that part of the wave is gone
+      S.norm = world.norm();
+      effects.ring(x, y, r, r * 0.55, 0.35, 'rgba(255,255,255,', 0.6);
+      effects.label(x, y - r - 4, 'NOT HERE', COLOR.miss);
+      audio.miss();
+      if (S.norm < 1e-9) respawnAtCheckpoint();
     }
   }
-  let fpsT = 0, fpsN = 0, fps = 0, costMs = 0, ticksLast = 0;
-  function dump() {
-    $('dbg').textContent = JSON.stringify({
-      scene: S.scene, lvl: S.lvl + 1, mode: S.mode, x: +S.px.toFixed(1), y: +S.py.toFixed(1), clock: +S.clock.toFixed(2),
-      norm: +S.norm.toFixed(4), fateGreen: +S.fateGreen.toFixed(3), fateRed: +S.fateRed.toFixed(3), looks: S.stats.looks, deaths: S.stats.deaths,
-      keys: S.keys.map(k => k.got), webgl: !!gl, fps: Math.round(fps), frameMs: +costMs.toFixed(2), canvas: glc.width + 'x' + glc.height,
-    });
-  }
-  window.__psi = { S, world, press, release, loadLevel, levels, snd, ticks: () => ticksLast };
 
-  // ---------------------------------------------------------------- boot
-  if (!initGL()) initFallback();
-  resize();
-  if (Q.has('lvl')) { S.scene = 'play'; loadLevel(Math.max(0, Math.min(levels.length - 1, +Q.get('lvl') - 1))); }
-  else buildTitle();
-  // The game advances in fixed 1/120 s ticks, so walking, charging, the lens and the physics are
-  // identical at 30, 60 or 144 Hz. A gap longer than a quarter second is a tab-away and is dropped.
-  const TICK = 1 / 120; let tickAcc = TICK / 2;   // start mid-tick so 60 and 120 Hz frames don't sit on a tick boundary
-  function advance(dt) {
-    tickAcc += dt; let n = 0;
-    while (tickAcc >= TICK - 1e-9 && S.clock < STOP) { runScript(); update(TICK); tickAcc -= TICK; if (++n >= 40) { tickAcc = TICK / 2; break; } }
-    ticksLast = n;
+  let pressedAt = -1;
+
+  /** Mouse button, Space or Enter went down. timestamp is the event's time in ms, if known. */
+  function press(timestamp) {
+    pressedAt = timestamp >= 0 ? timestamp : -1;
+    audio.start();
+    if (S.trans) return;
+    if (S.scene === 'title') { startGame(); return; }
+    if (S.scene === 'end') { transition(showTitle); return; }
+    if (S.mode === 'particle') { S.charging = true; S.chargeT = 0; }
+    else if (S.mode === 'wave' && S.lookCd <= 0) { S.lensOn = true; S.lensR = LENS.start; }
   }
-  if (Q.has('warp')) { const n = +Q.get('warp'); for (let i = 0; i < n && S.clock < STOP; i++) advance(FIXED_DT); }
-  let last = 0, frozen = false;
-  function frame(now) {
-    const raw = (now - last) / 1000; last = now;
-    let dt = FIXED ? FIXED_DT : (raw > 0.25 || !(raw >= 0) ? 0 : raw);
-    if (S.clock >= STOP) { if (!frozen) { frozen = true; document.title = 'DONE'; } dt = 0; }
-    const t0 = performance.now();
-    if (!frozen) advance(dt);
-    render(dt);
-    costMs += (performance.now() - t0 - costMs) * 0.1;
-    fpsN++; if (now - fpsT > 500) { fps = fpsN * 1000 / (now - fpsT); fpsT = now; fpsN = 0; }
-    if (Q.has('dbg')) dump();
-    requestAnimationFrame(frame);
+
+  function release(timestamp) {
+    const heldMs = timestamp >= 0 && pressedAt >= 0 ? timestamp - pressedAt : -1;
+    if (S.scene === 'play' && !S.trans) {
+      if (S.mode === 'particle' && S.charging) launch(heldMs);
+      else if (S.mode === 'wave' && S.lensOn) look();
+    }
+    S.charging = false; S.lensOn = false;
   }
-  requestAnimationFrame(t => { last = t; frame(t); });
-})();
+
+  function cancelInput() {
+    for (const direction in held) held[direction] = false;
+    S.charging = false; S.lensOn = false;
+  }
+
+  function restartLevel() {
+    if (S.scene === 'play' && !S.trans) transition(() => enterLevel(S.lvl));
+  }
+  function skipLevel() {
+    if (S.scene === 'play' && !S.trans) nextLevel();
+  }
+  function previousLevel() {
+    if (S.scene === 'play' && !S.trans && S.lvl > 0) transition(() => enterLevel(S.lvl - 1));
+  }
+
+  // ---------------------------------------------------------------- one tick of play
+
+  function walk(dt) {
+    let ix = (held.right ? 1 : 0) - (held.left ? 1 : 0);
+    let iy = (held.down ? 1 : 0) - (held.up ? 1 : 0);
+    const length = Math.hypot(ix, iy) || 1;
+    ix /= length; iy /= length;
+    const ease = Math.min(1, dt * 16);
+    S.vx += (ix * PLAYER.speed - S.vx) * ease;
+    S.vy += (iy * PLAYER.speed - S.vy) * ease;
+
+    // move in sub-steps of at most half a cell, one axis at a time, so walls are never skipped
+    let dx = S.vx * dt, dy = S.vy * dt;
+    const steps = Math.max(1, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy)) / 0.5));
+    dx /= steps; dy /= steps;
+    for (let s = 0; s < steps; s++) {
+      if (world.walk[clampCell(S.px + dx, S.py)]) S.px += dx; else S.vx = 0;
+      if (world.walk[clampCell(S.px, S.py + dy)]) S.py += dy; else S.vy = 0;
+    }
+  }
+
+  function collectKeys() {
+    for (const key of S.keys) {
+      if (key.got || Math.hypot(key.x - S.px, key.y - S.py) >= 6) continue;
+      key.got = true;
+      audio.key();
+      effects.burst(key.x, key.y, 24, COLOR.key, 40);
+      effects.ring(key.x, key.y, 2, 18, 0.5, COLOR.key, 0.8);
+      if (exitOpen() && S.exit) effects.label(S.exit.x, S.exit.y, 'EXIT AWAKE', COLOR.exitText);
+    }
+  }
+
+  /** Tell the choir where the wave is: its share in six horizontal bands, and left-right balance. */
+  function listen() {
+    const { R, I } = world;
+    bands.fill(0);
+    let weightedX = 0, total = 0;
+    for (let y = 0; y < H; y += 2) {
+      const band = Math.floor(y * 6 / H);
+      for (let x = 0, i = y * W; x < W; x += 2, i += 2) {
+        const density = R[i] * R[i] + I[i] * I[i];
+        bands[band] += density; weightedX += density * x; total += density;
+      }
+    }
+    if (total <= 0) return;
+    for (let i = 0; i < 6; i++) bands[i] /= total;
+    audio.wave(bands, (weightedX / total / W) * 2 - 1, true);
+  }
+  const hush = () => { if ((tickCount & 3) === 0) audio.wave(bands, 0, false); };
+
+  function tickParticle(dt) {
+    walk(dt);
+    if (touchingRed(S.px, S.py)) { die(S.px, S.py, 'DETECTED'); return; }
+    collectKeys();
+    if (exitOpen() && world.kind[clampCell(S.px, S.py)] === GREEN) { win(S.px, S.py); return; }
+    if (S.charging) S.chargeT += dt;
+
+    // The particle is drawn as a tight wave packet. Charging spreads it and shows its wavelength.
+    const c = charge(), k = S.charging ? momentum(c) : 0;
+    const aim = Math.atan2(pointer.y - S.py, pointer.x - S.px);
+    const grow = S.charging ? Math.min(1, S.chargeT / 0.22) : 0;
+    const sigma = PLAYER.idleSigma + (PLAYER.launchSigma - PLAYER.idleSigma) * grow * grow * (3 - 2 * grow);
+    world.packet(S.px, S.py, k * Math.cos(aim), k * Math.sin(aim), sigma, false, -S.t * (1.5 + 5 * k));
+    S.norm = world.norm();
+    hush();
+  }
+
+  function tickWave(dt) {
+    S.waveT += dt;
+    stepBudget += dt * SIM.stepsPerSecond;
+    const steps = Math.min(40, Math.floor(stepBudget));
+    stepBudget -= steps;
+
+    if (steps > 0) {
+      world.step(steps);
+      // Whatever a detector absorbs this tick, divided by what was there, is the chance it caught you.
+      const taken = world.absorb(steps, exitOpen());
+      const after = world.norm(), before = after + taken.red + taken.green;
+      if (before < 1e-9) { respawnAtCheckpoint(); return; }
+      const pGreen = taken.green / before, pRed = taken.red / before;
+      const roll = random();
+      S.fateGreen += S.surv * pGreen;
+      S.fateRed += S.surv * pRed;
+      S.surv *= Math.max(0, 1 - pGreen - pRed);
+      if (roll < pGreen) {
+        S.stats.logw += Math.log10(Math.max(S.fateGreen, 1e-9));
+        const cell = world.lastGreenCell;
+        win(cell >= 0 ? cellX(cell) : S.exit.x, cell >= 0 ? cellY(cell) : S.exit.y);
+        return;
+      }
+      if (roll < pGreen + pRed) {
+        S.stats.logw += Math.log10(Math.max(S.fateRed, 1e-9));
+        const cell = world.lastRedCell;
+        die(cell >= 0 ? cellX(cell) : S.px, cell >= 0 ? cellY(cell) : S.py, 'DETECTED');
+        return;
+      }
+      S.norm = after;
+      if (after < 0.25) { world.scale(1 / Math.sqrt(after)); S.norm = world.norm(); }   // keep the floats healthy
+    }
+
+    if (S.lensOn) S.lensR = Math.min(LENS.max, S.lensR + LENS.growth * dt);
+    const radius = S.lensOn ? S.lensR : LENS.start;
+    S.lens = {
+      x: pointer.x, y: pointer.y, r: radius,
+      p: S.norm > 0 ? Math.min(1, world.lensMass(pointer.x, pointer.y, radius) / S.norm) : 0,
+    };
+
+    if ((tickCount & 3) === 0) listen();
+    if (S.waveT > (level().coherence || SIM.coherence)) decohere();
+  }
+
+  function tickDead() {
+    S.norm = world.norm();
+    hush();
+    if (S.modeT > 6) [S.safeX, S.safeY] = level().start;        // a checkpoint that stays lethal is abandoned
+    if (S.modeT > RESPAWN_DELAY && !touchingRed(S.safeX, S.safeY)) {
+      S.px = S.safeX; S.py = S.safeY; S.vx = S.vy = 0;
+      S.mode = 'particle'; S.modeT = 0;
+      effects.ring(S.px, S.py, 20, 3, 0.35, COLOR.found, 0.8);
+    }
+  }
+
+  function tickPlay(dt) {
+    S.t += dt; S.modeT += dt; S.intro += dt;
+    S.stats.time += dt; S.levelStats.t += dt;
+    if (S.lookCd > 0) S.lookCd -= dt;
+    if (S.fateShow !== Infinity) S.fateShow -= dt;
+    moveSweepers(world, level(), S.t);
+
+    if (S.mode === 'particle') tickParticle(dt);
+    else if (S.mode === 'wave') tickWave(dt);
+    else if (S.mode === 'dead') tickDead();
+    else if (S.mode === 'won') {
+      S.norm = world.norm();
+      hush();
+      if (S.modeT > WIN_DELAY) nextLevel();
+    }
+  }
+
+  /** Advance the whole game by one fixed tick. */
+  function update(dt) {
+    S.clock += dt;
+    tickCount++;
+    S.flash = Math.max(0, S.flash - dt * 1.4);
+    S.shake = Math.max(0, S.shake - dt * 3);
+
+    if (S.trans) {
+      S.trans.t += dt;
+      if (!S.trans.done && S.trans.t >= FADE_OUT) { S.trans.done = true; S.trans.apply(); }
+      if (S.trans.t >= FADE_OUT + FADE_IN) S.trans = null;
+    }
+
+    if (S.scene === 'play') tickPlay(dt);
+    else S.norm = driftAmbient(world, ambientClock, dt, random);
+
+    effects.update(dt);
+  }
+
+  /** How dark the fade overlay is right now, 0 to 1. */
+  function fade() {
+    if (!S.trans) return 0;
+    const t = S.trans.t;
+    return Math.max(0, Math.min(1, t < FADE_OUT ? t / FADE_OUT : 1 - (t - FADE_OUT) / FADE_IN));
+  }
+
+  return {
+    S, world, effects, pointer, held, levels,
+    update, fade, press, release, cancelInput,
+    enterLevel, showTitle, showEnding, restartLevel, skipLevel, previousLevel,
+    level, exitOpen, charge,
+  };
+}

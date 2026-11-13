@@ -1,0 +1,16 @@
+{
+  "name": "psi",
+  "version": "1.0.0",
+  "description": "A game about being found. You are a particle until you choose to be a wave, on a real Schrödinger equation.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node tools/serve.mjs",
+    "check": "node tools/verify.mjs",
+    "playtest": "node tools/playtest.mjs",
+    "test": "node tools/verify.mjs && node tools/playtest.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
