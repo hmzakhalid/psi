@@ -25,6 +25,10 @@ body {
   -webkit-user-select: none;
 }
 
+#stage.menu {
+  cursor: default;
+}
+
 #stage canvas {
   position: absolute;
   inset: 0;

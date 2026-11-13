@@ -82,10 +82,12 @@ void main() {
   float bright = pow(min(d, 1.0), 0.42);
   vec3 wave = tint * bright * 1.5 + mix(tint, vec3(0.35, 0.5, 1.0), 0.6) * pow(glow, 0.6) * 0.5;
 
-  // mesh (dashed cyan) and glass (teal haze)
+  // mesh (dashed cyan) and glass (a faint teal body with a brighter rim)
   float special = texture2D(uSoft, uv).b;
   col += vec3(0.22, 0.70, 0.95) * smoothstep(0.55, 0.9, special) * (0.22 + 0.55 * step(0.5, fract(g.y / 2.0 + uTime * 0.25)));
-  col += vec3(0.07, 0.26, 0.30) * smoothstep(0.2, 0.43, special) * (1.0 - smoothstep(0.5, 0.6, special));
+  float notMesh = 1.0 - smoothstep(0.5, 0.6, special);
+  col += vec3(0.030, 0.105, 0.125) * smoothstep(0.15, 0.42, special) * notMesh;
+  col += vec3(0.16, 0.55, 0.62) * smoothstep(0.04, 0.2, special) * (1.0 - smoothstep(0.2, 0.40, special)) * notMesh;
 
   // detectors and barriers
   float red = smoothstep(0.3, 0.7, room.b), green = smoothstep(0.3, 0.7, room.g), barrier = smoothstep(0.3, 0.7, room.a);

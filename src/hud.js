@@ -4,6 +4,7 @@
 import { W, H, PARTICLE_RADIUS } from './physics.js';
 import { SIM } from './config.js';
 import { RING, SPARK } from './effects.js';
+import { cardRect, cardAt } from './rooms.js';
 
 const TAU = Math.PI * 2;
 const FONT = 'ui-monospace, "SF Mono", Menlo, Consolas, monospace';
@@ -13,7 +14,7 @@ const pad2 = n => String(n).padStart(2, '0');
 
 export function createHud(canvas, game, audio) {
   const ui = canvas.getContext('2d');
-  const { S, pointer, effects, levels } = game;
+  const { S, pointer, effects, levels, progress } = game;
   let textScale = 1;   // text grows a little when the game is shown small, so it stays readable
 
   // ---------------------------------------------------------------- drawing helpers
@@ -85,28 +86,31 @@ export function createHud(canvas, game, audio) {
       ui.stroke();
     }
     if (S.exit && !game.exitOpen()) {
-      text('ASLEEP', S.exit.x, S.exit.y, 3.2, 'rgba(200,205,220,0.55)', { align: 'center', weight: 700, spacing: 0.8 });
+      text('ASLEEP', Math.max(16, Math.min(W - 16, S.exit.x)), S.exit.y, 3.2, 'rgba(200,205,220,0.55)', { align: 'center', weight: 700, spacing: 0.8 });
     }
   }
 
-  /** For a player who has struggled in this room: where to stand and where to aim. */
+  /** For a player who has struggled in this room: the intended shot, drawn on the floor. */
   function drawGuide(level) {
     const guide = level.guide;
     if (!guide || S.mode === 'won') return;
-    if (S.levelStats.deaths < 2 && S.levelStats.t < 40) return;
+    const after = guide.after || { deaths: 2, seconds: 40 };
+    if (S.levelStats.deaths < after.deaths && S.levelStats.t < after.seconds) return;
+
     const alpha = 0.45 + 0.25 * Math.sin(S.clock * 3);
     ui.strokeStyle = `rgba(255,230,150,${alpha})`;
     ui.lineWidth = 0.5;
     dashed([1.4, 1.2], 0, () => {
-      for (const [x, y] of guide.spots) {
-        circle(x, y, PARTICLE_RADIUS + 2.5);
-        ui.moveTo(x, y);
-        ui.lineTo(guide.aimAt[0], guide.aimAt[1]);
+      for (const { from, at } of guide.shots) {
+        circle(from[0], from[1], PARTICLE_RADIUS + 2.5);
+        ui.moveTo(from[0], from[1]);
+        ui.lineTo(at[0], at[1]);
         ui.stroke();
       }
     });
-    const [x, y] = guide.spots[0];
-    text('stand on a ring, aim along its line, full charge', x, y - 10, 2.6, `rgba(255,230,150,${alpha + 0.25})`, { align: 'center', weight: 700 });
+    const [x, y] = guide.shots[0].from;
+    const noteY = y - 10 < 22 ? y + 10 : y - 10;
+    text(guide.note, Math.max(x, 4), noteY, 2.6, `rgba(255,230,150,${alpha + 0.25})`, { align: x < 70 ? 'left' : 'center', weight: 700 });
   }
 
   /** Where and how the last wave was launched, so a shot can be repeated or nudged. */
@@ -200,7 +204,7 @@ export function createHud(canvas, game, audio) {
 
     // nobody should be stranded in one room: after a while, say that it can be skipped
     const stuck = S.levelStats.deaths >= 4 || S.levelStats.t > 75;
-    const controls = (audio.muted ? 'R restart · M sound on' : 'R restart · M mute') + (stuck ? ' · ] skip this room' : '');
+    const controls = `H help · Esc rooms · R restart · M ${audio.muted ? 'sound on' : 'mute'}` + (stuck ? ' · ] skip this room' : '');
     text(controls, 8, 14.6, 2.4, stuck ? 'rgba(190,205,240,0.85)' : 'rgba(130,145,180,0.6)');
   }
 
@@ -227,6 +231,13 @@ export function createHud(canvas, game, audio) {
       ui.fillRect(W / 2 - (width / 2) * left, y0 + 3.2, width * left, 0.5);
       text('coherence', W / 2, y0 + 6.2, 2.4, 'rgba(180,190,225,0.6)', { align: 'center' });
     }
+  }
+
+  /** The two lines at the bottom: a fresh explanation if there is one, else what fits the moment. */
+  function hintLines(level) {
+    if (S.toast) return S.toast.lines;
+    if (S.mode === 'wave' && level.flight) return level.flight;
+    return level.hint;
   }
 
   function drawHint(lines) {
@@ -263,7 +274,7 @@ export function createHud(canvas, game, audio) {
 
     drawHeader(level);
     drawFate(level);
-    drawHint(level.hint);
+    drawHint(hintLines(level));
     drawRoomCard(level);
     if (S.mode === 'won') {
       const stats = S.levelStats;
@@ -281,8 +292,87 @@ export function createHud(canvas, game, audio) {
     panel(W / 2 - 74, 110, 148, 28, 14, 'rgba(5,7,16,0.62)');
     text('a game about being found', W / 2, 116, 5.2, 'rgba(240,244,255,0.95)', { align: 'center', weight: 700, spacing: 1.4 });
     text('You are a particle until you choose to be a wave.', W / 2, 124, 3.1, 'rgba(175,190,225,0.9)', { align: 'center', spacing: 0.2 });
-    text('click to begin', W / 2, 132, 3.4, `rgba(150,225,255,${blink()})`, { align: 'center', weight: 700, spacing: 1.2 });
+    text(progress.reached > 0 ? 'click to continue' : 'click to begin', W / 2, 132, 3.4, `rgba(150,225,255,${blink()})`, { align: 'center', weight: 700, spacing: 1.2 });
     text('a real Schrödinger equation is running behind this text', W / 2, 7, 2.6, 'rgba(165,180,215,0.8)', { align: 'center', spacing: 0.3 });
+    text('mouse and keyboard · H for how it works', W / 2, H - 5, 2.4, 'rgba(150,165,205,0.7)', { align: 'center', spacing: 0.3 });
+  }
+
+  // ---------------------------------------------------------------- room select
+
+  function drawRooms() {
+    drawEffects();
+    text('ROOMS', W / 2 + 1, 13, 7, 'rgba(255,255,255,0.95)', { align: 'center', weight: 700, spacing: 3 });
+    text('click a room to enter · Esc for the title', W / 2, 21.5, 2.6, 'rgba(165,180,215,0.8)', { align: 'center', spacing: 0.2 });
+
+    const hovered = cardAt(pointer.x, pointer.y, levels.length);
+    levels.forEach((level, i) => {
+      const { x, y, w, h } = cardRect(i);
+      const open = i <= progress.reached;
+      const best = progress.cleared[level.name];
+      const hot = open && i === hovered;
+
+      panel(x, y, w, h, 3, hot ? 'rgba(28,40,78,0.92)' : open ? 'rgba(10,14,30,0.86)' : 'rgba(8,10,20,0.6)');
+      ui.strokeStyle = hot ? 'rgba(150,225,255,0.95)' : best ? 'rgba(120,255,190,0.55)' : open ? 'rgba(150,170,230,0.4)' : 'rgba(110,120,150,0.18)';
+      ui.lineWidth = hot ? 0.7 : 0.4;
+      ui.stroke();
+
+      const ink = open ? 1 : 0.35;
+      text(pad2(i + 1), x + 4, y + 6.5, 3, `rgba(150,170,215,${0.9 * ink})`, { weight: 700, spacing: 0.4 });
+      text(level.name, x + w / 2, y + 14.5, 3.5, `rgba(240,244,255,${0.96 * ink})`, { align: 'center', weight: 700, spacing: 0.6, maxWidth: w - 5 });
+      const status = best ? `cleared · ${best.seconds}s` : open ? 'open' : 'locked';
+      const statusColor = best ? 'rgba(140,255,195,0.9)' : open ? 'rgba(150,225,255,0.85)' : 'rgba(140,150,180,0.4)';
+      text(status, x + w / 2, y + 23.5, 2.5, statusColor, { align: 'center', spacing: 0.2 });
+    });
+  }
+
+  // ---------------------------------------------------------------- how it works
+
+  const HELP = [
+    ['head', 'HOW ψ WORKS'],
+    ['body', 'You are a particle. You walk, and walls stop you.'],
+    ['body', 'Hold the mouse button to charge, release to become a wave.'],
+    ['body', 'A wave moves by itself and slips through gaps a walker cannot.'],
+    ['gap'],
+    ['sub', 'A WAVE BECOMES A PARTICLE AGAIN IN THREE WAYS'],
+    ['green', '1   Green catches it. You win the room. You do nothing.'],
+    ['white', '2   You click on it. You appear there, with the odds shown.'],
+    ['soft', '3   Time runs out. You appear somewhere the wave was.'],
+    ['gap'],
+    ['red', 'Red catches waves too, and that kills you.'],
+    ['body', 'The bar at the top shows how much of you each colour has taken.'],
+    ['body', 'A longer charge is a faster wave: it leaks through thin barriers.'],
+    ['gap'],
+    ['keys', 'WASD walk · mouse aim · hold and release to fire · click to look'],
+    ['keys', 'R restart · Esc rooms · M mute · ] skip a room'],
+  ];
+  const HELP_STYLE = {
+    head: { size: 6.5, color: 'rgba(255,255,255,0.97)', weight: 700, spacing: 2.2, step: 10 },
+    sub: { size: 2.9, color: 'rgba(150,170,215,0.95)', weight: 700, spacing: 0.9, step: 6.4 },
+    body: { size: 3.2, color: 'rgba(205,215,240,0.95)', weight: 400, spacing: 0.15, step: 5.6 },
+    green: { size: 3.2, color: 'rgba(140,255,195,0.98)', weight: 700, spacing: 0.15, step: 5.6 },
+    white: { size: 3.2, color: 'rgba(240,246,255,0.98)', weight: 700, spacing: 0.15, step: 5.6 },
+    soft: { size: 3.2, color: 'rgba(200,205,255,0.95)', weight: 700, spacing: 0.15, step: 5.6 },
+    red: { size: 3.2, color: 'rgba(255,140,155,0.98)', weight: 700, spacing: 0.15, step: 5.6 },
+    keys: { size: 2.7, color: 'rgba(160,175,215,0.9)', weight: 400, spacing: 0.2, step: 5 },
+  };
+
+  function drawHelp() {
+    ui.fillStyle = 'rgba(3,4,10,0.72)';
+    ui.fillRect(0, 0, W, H);
+    const width = 178, height = 112, x = (W - width) / 2, y = (H - height) / 2;
+    panel(x, y, width, height, 4, 'rgba(8,11,24,0.96)');
+    ui.strokeStyle = 'rgba(150,170,230,0.35)';
+    ui.lineWidth = 0.4;
+    ui.stroke();
+
+    let lineY = y + 12;
+    for (const [kind, line] of HELP) {
+      if (kind === 'gap') { lineY += 3; continue; }
+      const style = HELP_STYLE[kind];
+      text(line, W / 2, lineY, style.size, style.color, { align: 'center', weight: style.weight, spacing: style.spacing, maxWidth: width - 12 });
+      lineY += style.step;
+    }
+    text('click or press H to close', W / 2, y + height - 6, 2.6, `rgba(150,225,255,${blink()})`, { align: 'center', weight: 700, spacing: 0.6 });
   }
 
   /** The whole run as one branch of the wavefunction: the product of every outcome's odds. */
@@ -306,7 +396,7 @@ export function createHud(canvas, game, audio) {
     text('This exact run happens in', W / 2, 75, 3.2, 'rgba(175,190,225,0.9)', { align: 'center' });
     text(worlds(), W / 2, 83, 6, 'rgba(150,225,255,0.98)', { align: 'center', weight: 700, spacing: 0.8 });
     text('Every other you is still out there, somewhere in the wave.', W / 2, 92, 3.2, 'rgba(175,190,225,0.9)', { align: 'center' });
-    text('click to play again', W / 2, 104, 3.4, `rgba(150,225,255,${blink()})`, { align: 'center', weight: 700, spacing: 1.2 });
+    text('click for the rooms', W / 2, 104, 3.4, `rgba(150,225,255,${blink()})`, { align: 'center', weight: 700, spacing: 1.2 });
   }
 
   // ---------------------------------------------------------------- frame
@@ -322,7 +412,13 @@ export function createHud(canvas, game, audio) {
 
     if (S.scene === 'play') drawPlay();
     else if (S.scene === 'title') drawTitle();
+    else if (S.scene === 'rooms') drawRooms();
     else drawEnding();
+
+    if (S.help) {
+      ui.setTransform(scale, 0, 0, scale, 0, 0);
+      drawHelp();
+    }
 
     const fade = game.fade();
     if (fade > 0) {

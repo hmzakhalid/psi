@@ -148,6 +148,71 @@ const strategies = {
     return s;
   },
 
+  async GENTLY(done) {
+    let s = await state();
+    for (let tries = 0; tries < 12 && !done(s); tries++) {
+      s = await becomeParticle();
+      if (done(s)) break;
+      if (s.x > 82) { s = await walkTo(Math.min(s.x, 200), 10); break; }   // decohered past the mesh: walk up to the exit
+      await fire(150, 100, 40);                                          // a tap: slow waves glance off the barrier
+      s = await flightOver();
+    }
+    return s;
+  },
+
+  async RETURN(done) {
+    let s = await state();
+    for (let tries = 0; tries < 24 && !done(s); tries++) {
+      s = await becomeParticle();
+      if (done(s)) break;
+      if (!s.keys[0] && s.x < 96) {                                       // leak through, then look before the red wall
+        await walkTo(50, 72, 2);
+        await fire(96, 72);
+        await move(150, 72); await sleep(800);
+        s = await look(150, 72, 450);
+        if (s.mode === 'wave') s = await flightOver();
+      } else if (!s.keys[0]) {
+        await walkTo(196, 28, 3);
+      } else if (s.x > 100) {                                             // key in hand: tunnel back to the exit
+        await fire(20, s.y);
+        s = await flightOver();
+      } else {
+        s = await walkTo(8, s.y);
+      }
+    }
+    return s;
+  },
+
+  async RICOCHET(done) {
+    let s = await state();
+    for (let tries = 0; tries < 12 && !done(s); tries++) {
+      s = await becomeParticle();
+      if (done(s)) break;
+      if (s.x > 56) {                                                     // decohered in the hall: under the first red, over the second
+        const path = s.x < 112 ? [[s.x, 110], [140, 110], [140, 40]] : s.x < 166 ? [[140, s.y], [140, 40]] : [[200, s.y]];
+        await walkPath([...path, [200, 40], [246, 40]]);
+        s = await waitFor(done, 2000);
+        break;
+      }
+      await fire(70, 141);                                                // one bounce off the floor
+      s = await flightOver();
+    }
+    return s;
+  },
+
+  async LENS(done) {
+    let s = await state();
+    for (let tries = 0; tries < 12 && !done(s); tries++) {
+      s = await becomeParticle();
+      if (done(s)) break;
+      if (s.x > 66) { await walkPath([[s.x, 72], [244, 72]]); s = await waitFor(done, 2000); break; }
+      await walkTo(36, 72, 1.5);                                          // line up with the lens and the slot
+      await fire(108, 72);
+      s = await flightOver();
+    }
+    return s;
+  },
+
   async MIRROR(done) {
     let s = await state();
     for (let tries = 0; tries < 12 && !done(s); tries++) {

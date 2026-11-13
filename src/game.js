@@ -9,6 +9,8 @@ import { PLAYER, CHARGE, LENS, SIM, momentum } from './config.js';
 import { random } from './rng.js';
 import { createEffects } from './effects.js';
 import { buildTitleRoom, buildEndRoom, driftAmbient } from './ambient.js';
+import { loadProgress, saveProgress } from './progress.js';
+import { cardAt } from './rooms.js';
 
 const COLOR = {
   found: 'rgba(170,235,255,',
@@ -25,6 +27,14 @@ const COLOR = {
 const RESPAWN_DELAY = 0.75;     // seconds between dying and standing again
 const WIN_DELAY = 1.5;          // seconds the win is shown before the next room
 const FADE_OUT = 0.35, FADE_IN = 0.4;
+const TOAST_SECONDS = 6;        // how long an explanation stays up after the event it explains
+
+// One-off explanations, shown the first few times something confusing happens.
+const LESSON = {
+  decohered: { times: 3, lines: ['Coherence ran out, so the room measured you.', 'You reappeared somewhere the wave was. Fire again.'] },
+  caught: { times: 3, lines: ['A red detector caught you.', 'Every bit of wave a red absorbs is a chance of that. Keep the wave away from red.'] },
+  missed: { times: 2, lines: ['You were not there, so that part of the wave is gone.', 'The rest of you flies on. Look again where it is bright.'] },
+};
 
 const clampCell = (x, y) => Math.max(0, Math.min(H - 1, Math.round(y))) * W + Math.max(0, Math.min(W - 1, Math.round(x)));
 const cellX = i => i % W;
@@ -44,11 +54,16 @@ export function createGame(audio) {
   const pointer = { x: W * 0.6, y: H * 0.5 };                       // in grid cells
   const held = { left: false, right: false, up: false, down: false };   // walking keys
 
+  const progress = loadProgress();
+  const lessonsShown = { decohered: 0, caught: 0, missed: 0 };
+
   const freshStats = () => ({ looks: 0, deaths: 0, time: 0, waves: 0, logw: 0 });
 
   // Everything about the current moment of play. The HUD and the tests read this.
   const S = {
-    scene: 'title',            // 'title' | 'play' | 'end'
+    scene: 'title',            // 'title' | 'rooms' | 'play' | 'end'
+    help: false,               // the how-it-works overlay is open, and play is paused
+    toast: null,               // a short explanation shown in place of the hint: { lines, t }
     clock: 0,                  // seconds since the page loaded
     lvl: 0,
     t: 0,                      // seconds in this room
@@ -83,6 +98,10 @@ export function createGame(audio) {
   const level = () => levels[S.lvl];
   const exitOpen = () => S.keys.every(k => k.got);
 
+  function teach(lesson) {
+    if (lessonsShown[lesson]++ < LESSON[lesson].times) S.toast = { lines: LESSON[lesson].lines, t: 0 };
+  }
+
   // ---------------------------------------------------------------- scenes
 
   /** Fade to black, apply a change, fade back. Ignored while another fade is running. */
@@ -107,7 +126,7 @@ export function createGame(audio) {
     S.mode = 'particle'; S.modeT = 0; S.t = 0; S.intro = 0;
     S.charging = false; S.lensOn = false;
     S.lens = { x: pointer.x, y: pointer.y, r: LENS.start, p: 0 };
-    S.fateShow = 0; S.mark = null;
+    S.fateShow = 0; S.mark = null; S.toast = null;
     S.levelStats = { looks: 0, deaths: 0, t: 0 };
     stepBudget = 0;
     effects.clear();
@@ -125,12 +144,31 @@ export function createGame(audio) {
     ambientClock.spawnIn = 0; S.norm = 1;
   }
 
-  function startGame() {
-    transition(() => { S.scene = 'play'; S.stats = freshStats(); enterLevel(0); });
+  function showRooms() {
+    S.scene = 'rooms';
+    buildEndRoom(world, random);
+    ambientClock.spawnIn = 0; S.norm = 1;
+  }
+
+  function openRoom(index) {
+    transition(() => { S.scene = 'play'; S.stats = freshStats(); enterLevel(index); });
   }
 
   function nextLevel() {
     transition(() => { if (S.lvl + 1 >= levels.length) showEnding(); else enterLevel(S.lvl + 1); });
+  }
+
+  /** Open the room after `index` to the player, and remember it. */
+  function unlockAfter(index) {
+    progress.reached = Math.max(progress.reached, Math.min(index + 1, levels.length - 1));
+    saveProgress(progress);
+  }
+
+  function recordClear() {
+    const best = progress.cleared[level().name];
+    const run = { seconds: +S.levelStats.t.toFixed(1), looks: S.levelStats.looks, deaths: S.levelStats.deaths };
+    if (!best || run.seconds < best.seconds) progress.cleared[level().name] = run;
+    unlockAfter(S.lvl);
   }
 
   // ---------------------------------------------------------------- being caught, dying, respawning
@@ -187,6 +225,7 @@ export function createGame(audio) {
       [S.safeX, S.safeY] = level().start;
       S.safeDeaths = 0;
     }
+    if (S.mode === 'wave') teach('caught');
     endFlight(1.6);
     S.mode = 'dead'; S.modeT = 0;
     world.clearPsi();
@@ -201,7 +240,8 @@ export function createGame(audio) {
 
   function win(x, y) {
     endFlight(2);
-    S.mode = 'won'; S.modeT = 0;
+    S.mode = 'won'; S.modeT = 0; S.toast = null;
+    recordClear();
     world.clearPsi();
     S.px = x; S.py = y;
     effects.burst(x, y, 60, COLOR.exit, 60);
@@ -219,6 +259,7 @@ export function createGame(audio) {
     if (cell < 0) { respawnAtCheckpoint(); return; }
     audio.decohere();
     materialize(cell, 'DECOHERED', COLOR.decohered);
+    if (S.mode === 'particle') teach('decohered');
   }
 
   // ---------------------------------------------------------------- the player's two actions
@@ -269,19 +310,32 @@ export function createGame(audio) {
       effects.ring(x, y, r, r * 0.55, 0.35, 'rgba(255,255,255,', 0.6);
       effects.label(x, y - r - 4, 'NOT HERE', COLOR.miss);
       audio.miss();
+      teach('missed');
       if (S.norm < 1e-9) respawnAtCheckpoint();
     }
   }
 
   let pressedAt = -1;
 
-  /** Mouse button, Space or Enter went down. timestamp is the event's time in ms, if known. */
-  function press(timestamp) {
+  /**
+   * Mouse button, Space or Enter went down. timestamp is the event's time in ms, if known;
+   * fromKeyboard says the pointer is not what the player is choosing with.
+   */
+  function press(timestamp, fromKeyboard = false) {
     pressedAt = timestamp >= 0 ? timestamp : -1;
     audio.start();
     if (S.trans) return;
-    if (S.scene === 'title') { startGame(); return; }
-    if (S.scene === 'end') { transition(showTitle); return; }
+    if (S.help) { S.help = false; return; }
+    if (S.scene === 'title') {
+      if (progress.reached > 0) transition(showRooms); else openRoom(0);
+      return;
+    }
+    if (S.scene === 'rooms') {
+      const card = fromKeyboard ? progress.reached : cardAt(pointer.x, pointer.y, levels.length);
+      if (card >= 0 && card <= progress.reached) { audio.click(); openRoom(card); }
+      return;
+    }
+    if (S.scene === 'end') { transition(showRooms); return; }
     if (S.mode === 'particle') { S.charging = true; S.chargeT = 0; }
     else if (S.mode === 'wave' && S.lookCd <= 0) { S.lensOn = true; S.lensR = LENS.start; }
   }
@@ -301,13 +355,30 @@ export function createGame(audio) {
   }
 
   function restartLevel() {
-    if (S.scene === 'play' && !S.trans) transition(() => enterLevel(S.lvl));
+    if (S.scene === 'play' && !S.trans && !S.help) transition(() => enterLevel(S.lvl));
   }
   function skipLevel() {
-    if (S.scene === 'play' && !S.trans) nextLevel();
+    if (S.scene !== 'play' || S.trans || S.help) return;
+    unlockAfter(S.lvl);
+    nextLevel();
+  }
+
+  /** H: open or close the how-it-works overlay. Play is paused while it is open. */
+  function toggleHelp() {
+    if (S.trans) return;
+    S.help = !S.help;
+    if (S.help) cancelInput();
+  }
+
+  /** Escape: close help, or step back one screen (room → rooms → title). */
+  function back() {
+    if (S.trans) return;
+    if (S.help) { S.help = false; return; }
+    if (S.scene === 'play' || S.scene === 'end') transition(showRooms);
+    else if (S.scene === 'rooms') transition(showTitle);
   }
   function previousLevel() {
-    if (S.scene === 'play' && !S.trans && S.lvl > 0) transition(() => enterLevel(S.lvl - 1));
+    if (S.scene === 'play' && !S.trans && !S.help && S.lvl > 0) transition(() => enterLevel(S.lvl - 1));
   }
 
   // ---------------------------------------------------------------- one tick of play
@@ -435,6 +506,7 @@ export function createGame(audio) {
   function tickPlay(dt) {
     S.t += dt; S.modeT += dt; S.intro += dt;
     S.stats.time += dt; S.levelStats.t += dt;
+    if (S.toast && (S.toast.t += dt) > TOAST_SECONDS) S.toast = null;
     if (S.lookCd > 0) S.lookCd -= dt;
     if (S.fateShow !== Infinity) S.fateShow -= dt;
     moveSweepers(world, level(), S.t);
@@ -462,8 +534,8 @@ export function createGame(audio) {
       if (S.trans.t >= FADE_OUT + FADE_IN) S.trans = null;
     }
 
-    if (S.scene === 'play') tickPlay(dt);
-    else S.norm = driftAmbient(world, ambientClock, dt, random);
+    if (S.scene !== 'play') S.norm = driftAmbient(world, ambientClock, dt, random);
+    else if (!S.help) tickPlay(dt);
 
     effects.update(dt);
   }
@@ -476,9 +548,10 @@ export function createGame(audio) {
   }
 
   return {
-    S, world, effects, pointer, held, levels,
+    S, world, effects, pointer, held, levels, progress,
     update, fade, press, release, cancelInput,
-    enterLevel, showTitle, showEnding, restartLevel, skipLevel, previousLevel,
+    enterLevel, showTitle, showRooms, showEnding,
+    restartLevel, skipLevel, previousLevel, toggleHelp, back,
     level, exitOpen, charge,
   };
 }

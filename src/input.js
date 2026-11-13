@@ -43,11 +43,13 @@ export function bindInput(stage, game, audio) {
     }
     if (isActionKey(event.code)) {
       event.preventDefault();
-      if (!event.repeat) game.press(event.timeStamp);
+      if (!event.repeat) game.press(event.timeStamp, true);
       return;
     }
     if (event.repeat) return;
     if (event.code === 'KeyM') audio.toggleMute();
+    else if (event.code === 'KeyH' || event.key === '?') game.toggleHelp();
+    else if (event.code === 'Escape') game.back();
     else if (event.code === 'KeyR') game.restartLevel();
     else if (event.code === 'BracketRight') game.skipLevel();
     else if (event.code === 'BracketLeft') game.previousLevel();

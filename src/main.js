@@ -70,6 +70,9 @@ function runScript() {
     else if (command === 'key') game.held[args[0]] = args[1] === '1';
     else if (command === 'lvl') game.enterLevel(Number(args[0]) - 1);
     else if (command === 'end') game.showEnding();
+    else if (command === 'rooms') game.showRooms();
+    else if (command === 'help') game.toggleHelp();
+    else if (command === 'reach') game.progress.reached = Number(args[0]);
     else if (command === 'allkeys') for (const key of S.keys) key.got = true;
   }
 }
@@ -126,6 +129,7 @@ function frame(now) {
 
   const started = performance.now();
   if (dt > 0) advance(dt);
+  stage.classList.toggle('menu', S.scene === 'rooms' || S.help);   // menus use the system cursor
   resize();
   renderer.draw(game.world, { time: S.clock, locked: S.scene === 'play' && !game.exitOpen(), flash: S.flash, norm: S.norm, dt });
   hud.draw();
