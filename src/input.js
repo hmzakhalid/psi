@@ -13,6 +13,11 @@ const isActionKey = code => code === 'Space' || code === 'Enter';
 export function bindInput(stage, game, audio) {
   const { pointer, held } = game;
 
+  function toggleFullscreen() {
+    if (document.fullscreenElement) document.exitFullscreen?.();
+    else stage.requestFullscreen?.().catch(() => {});   // refused or unsupported: stay windowed
+  }
+
   /** Pointer position in grid cells. */
   function track(event) {
     const box = stage.getBoundingClientRect();
@@ -50,6 +55,7 @@ export function bindInput(stage, game, audio) {
     if (event.code === 'KeyM') audio.toggleMute();
     else if (event.code === 'KeyH' || event.key === '?') game.toggleHelp();
     else if (event.code === 'Escape') game.back();
+    else if (event.code === 'KeyF') toggleFullscreen();
     else if (event.code === 'KeyR') game.restartLevel();
     else if (event.code === 'BracketRight') game.skipLevel();
     else if (event.code === 'BracketLeft') game.previousLevel();

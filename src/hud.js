@@ -294,7 +294,9 @@ export function createHud(canvas, game, audio) {
     text('You are a particle until you choose to be a wave.', W / 2, 124, 3.1, 'rgba(175,190,225,0.9)', { align: 'center', spacing: 0.2 });
     text(progress.reached > 0 ? 'click to continue' : 'click to begin', W / 2, 132, 3.4, `rgba(150,225,255,${blink()})`, { align: 'center', weight: 700, spacing: 1.2 });
     text('a real Schrödinger equation is running behind this text', W / 2, 7, 2.6, 'rgba(165,180,215,0.8)', { align: 'center', spacing: 0.3 });
-    text('mouse and keyboard · H for how it works', W / 2, H - 5, 2.4, 'rgba(150,165,205,0.7)', { align: 'center', spacing: 0.3 });
+    const touchOnly = typeof matchMedia === 'function' && matchMedia('(hover: none) and (pointer: coarse)').matches;
+    const note = touchOnly ? 'this game needs a mouse and a keyboard' : 'mouse and keyboard · H how it works · F fullscreen';
+    text(note, W / 2, H - 5, 2.4, touchOnly ? 'rgba(255,220,150,0.9)' : 'rgba(150,165,205,0.7)', { align: 'center', spacing: 0.3 });
   }
 
   // ---------------------------------------------------------------- room select
@@ -343,7 +345,7 @@ export function createHud(canvas, game, audio) {
     ['body', 'A longer charge is a faster wave: it leaks through thin barriers.'],
     ['gap'],
     ['keys', 'WASD walk · mouse aim · hold and release to fire · click to look'],
-    ['keys', 'R restart · Esc rooms · M mute · ] skip a room'],
+    ['keys', 'R restart · Esc rooms · M mute · F fullscreen · ] skip a room'],
   ];
   const HELP_STYLE = {
     head: { size: 6.5, color: 'rgba(255,255,255,0.97)', weight: 700, spacing: 2.2, step: 10 },

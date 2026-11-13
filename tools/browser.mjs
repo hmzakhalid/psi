@@ -34,7 +34,7 @@ const MIME = {
   '.json': 'application/json',
 };
 
-const KEY_CODES = { KeyW: 87, KeyA: 65, KeyS: 83, KeyD: 68, KeyR: 82, KeyM: 77, KeyH: 72, Space: 32, Enter: 13, Escape: 27, BracketRight: 221 };
+const KEY_CODES = { KeyW: 87, KeyA: 65, KeyS: 83, KeyD: 68, KeyR: 82, KeyM: 77, KeyH: 72, KeyF: 70, Space: 32, Enter: 13, Escape: 27, BracketRight: 221 };
 
 /** Serve the repository root over http on a free port. ES modules do not load from file://. */
 export async function serve(root = ROOT) {

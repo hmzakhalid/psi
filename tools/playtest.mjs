@@ -332,6 +332,58 @@ for (const { name, number } of rooms) {
   console.log(`  ${cleared ? 'ok  ' : 'FAIL'} ${String(number).padStart(2)} ${name.padEnd(14)} ${took}s  looks ${end.looks}  deaths ${end.deaths}${end.error ? '  ' + end.error : ''}`);
 }
 
+// ------------------------------------------------------------------ menus
+
+/** Title, room select, help and saved progress, driven the way a player would. */
+async function menus() {
+  const problems = [];
+  const expect = (ok, what) => { if (!ok) problems.push(what); };
+  const scene = async () => (await state()).scene;
+  const tap = async (x, y) => { await move(x, y); await press(x, y); await sleep(60); await release(x, y); };
+  const settled = () => waitFor(s => !s.busy, 3000);
+
+  await browser.goto(baseUrl);
+  await evaluate('localStorage.clear()');
+  await browser.goto(baseUrl);
+  expect(await scene() === 'title', 'the game opens on the title');
+  await tap(128, 72); await sleep(500); await settled();
+  let s = await state();
+  expect(s.scene === 'play' && s.index === 0, 'a first click starts room 1');
+
+  await keyDown('KeyH'); await keyUp('KeyH'); await sleep(100);
+  expect(await evaluate('window.__psi.S.help') === true, 'H opens help');
+  const frozenAt = (await state()).t; await sleep(300);
+  expect((await state()).t === frozenAt, 'play is paused while help is open');
+  await tap(128, 72); await sleep(100);
+  expect(await evaluate('window.__psi.S.help') === false, 'a click closes help');
+  expect((await state()).mode === 'particle', 'that click does not fire a wave');
+
+  await walkPath([[36, 118], [130, 118], [130, 25], [200, 25], [200, 72], [242, 72]]);
+  s = await waitFor(st => st.index === 1 && !st.busy, 6000);
+  expect(s.index === 1, 'clearing room 1 leads to room 2');
+
+  await keyDown('Escape'); await keyUp('Escape'); await sleep(500); await settled();
+  expect(await scene() === 'rooms', 'Esc opens the room select');
+  await tap(230, 110); await sleep(500); await settled();          // room 12 is locked
+  expect(await scene() === 'rooms', 'a locked room cannot be entered');
+  await tap(38, 45); await sleep(500); await settled();            // room 1's card
+  s = await state();
+  expect(s.scene === 'play' && s.index === 0, 'clicking a card enters that room');
+
+  await browser.goto(baseUrl);                                     // a new visit
+  const saved = await evaluate('JSON.stringify(window.__psi.game.progress)');
+  expect(JSON.parse(saved).reached >= 1 && !!JSON.parse(saved).cleared.PARTICLE, 'progress survives a reload: ' + saved);
+  await tap(128, 72); await sleep(500); await settled();
+  expect(await scene() === 'rooms', 'a returning player lands on the room select');
+  return problems;
+}
+
+if (!wanted.length || args.includes('--menus')) {
+  const problems = await menus();
+  if (problems.length) failures++;
+  console.log(problems.length ? `  FAIL menus: ${problems.join('; ')}` : '  ok   menus: title, help, room select, saved progress');
+}
+
 if (browser.errors.length) {
   failures++;
   console.log('page errors:');
@@ -339,7 +391,7 @@ if (browser.errors.length) {
 } else {
   console.log('no page errors');
 }
-console.log(failures ? 'PLAYTEST FAILED' : `all ${rooms.length} rooms cleared`);
+console.log(failures ? 'PLAYTEST FAILED' : `playtest passed (${rooms.length} rooms)`);
 
 await browser.close();
 if (server) server.close();
